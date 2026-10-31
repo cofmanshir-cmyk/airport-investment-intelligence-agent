@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw source data: large files stay local, see docs/DATA_SOURCES.md
+data/raw/*
+!data/raw/L_DISTANCE_GROUP_500.csv

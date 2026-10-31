@@ -1,0 +1,49 @@
+{
+  "retrieved_at": "2026-10-31T14:32:15+00:00",
+  "sources": {
+    "t100_airport_summary": {
+      "url": "https://data.bts.gov/resource/r495-tyji.json",
+      "rows": 134619,
+      "first_month": "2014-01-01",
+      "last_month": "2026-07-01",
+      "airports": 2104
+    },
+    "t100_national_summary": {
+      "url": "https://data.bts.gov/resource/bu82-4pwz.json",
+      "rows": 151,
+      "last_month": "2026-07-01"
+    },
+    "t100_route_file": {
+      "file": "T_T100_SEGMENT_US_CARRIER_ONLY 3.csv",
+      "size_bytes": 94990997,
+      "sha256": "5c60f063a33067e63563d1827b8b1303e6ae947ecd364c319065915b8a76c5ba",
+      "rows": 302774,
+      "exact_duplicate_rows": 0,
+      "first_period": "2026-01",
+      "last_period": "2026-07",
+      "months": 7,
+      "origin_airports": 1558,
+      "carriers": 100,
+      "data_sources": [
+        "DU",
+        "IU"
+      ],
+      "rows_with_zero_departures": 994,
+      "performed_rows_with_zero_distance": 2582
+    },
+    "faa_enplanements": {
+      "url": "https://www.faa.gov/airports/planning_capacity/passenger_allcargo_stats/passenger/arp-cy2025-commercial-service-enplanements.xlsx",
+      "rows": 516,
+      "sha256": "91c8d4457e9558b8bcb65c2a27cd9b95062e3c7b443e58e9714ba77942777b40"
+    },
+    "ontime": {
+      "url_template": "https://www.transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip",
+      "period": "2025-01 to 2025-12",
+      "months": 12,
+      "airports": 352
+    }
+  },
+  "validation": {
+    "airport_months_where_total_differs_from_dom_plus_outbound": 0
+  }
+}
