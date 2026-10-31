@@ -11,7 +11,7 @@ import sys
 import anthropic
 from google.genai import errors as gemini_errors
 
-from . import gemini_agent
+from . import gemini_agent, presentation
 from .agent import Agent, AgentError, Answer
 
 HELP = "Commands: /raw shows the last tool results as JSON; /quit exits."
@@ -34,6 +34,9 @@ def render_evidence(answer: Answer) -> str:
         if call.is_error:
             lines.append(f"  Rejected input: {call.result['error']}")
             continue
+        if call.result.get("disclaimer"):
+            lines.append(f"  Disclaimer: {call.result['disclaimer']}")
+        lines.extend(f"  WARNING: {alert}" for alert in presentation.small_base_alerts([call]))
         lines.extend(f"  Source: {source}" for source in call.result.get("sources", []))
         lines.extend(f"  Caveat: {caveat}" for caveat in call.result.get("caveats", []))
     if answer.unverified_numbers:

@@ -56,3 +56,6 @@ FAA_TO_T100_CODES = {
     "AWI": "AIN", "Z13": "KKI", "BVK": "BKC", "D76": "ORV", "DUY": "KKH", "16A": "NUP",
     "MDM": "MLL", "HLA": "HSL", "4A2": "ATT", "GGV": "KWK",
 }
+
+# Route-file codes that differ from the summary and FAA code for the same airport.
+ROUTE_TO_T100_CODES = {"PBI": "DJT"}

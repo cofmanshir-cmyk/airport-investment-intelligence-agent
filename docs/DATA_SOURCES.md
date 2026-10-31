@@ -42,6 +42,12 @@ connecting passenger appears once at each airport they depart from, so:
   which is not in the MVP. Hub growth may reflect airline network decisions rather
   than local demand.
 
+**Reconciliation across API datasets.** For 2015, 2022 and 2025, airport departures, passengers and
+seats each equal national domestic plus outbound exactly, and national totals equal domestic plus
+outbound plus inbound exactly. Airport and national totals must not be mixed in a ratio, because
+national totals include inbound traffic. The API publishes field names but no column definitions, so this
+evidence comes from these checks.
+
 **Cross-check.** For the 142 hub airports matched to the FAA file, 2025 T-100
 passengers are 0.995–1.033 times FAA enplanements, with a median of 1.005.
 
@@ -66,6 +72,8 @@ passengers are 0.995–1.033 times FAA enplanements, with a median of 1.005.
   destination. They stay in the departure total and count as not long-haul. At ANC
   they are 183 of 43,066 departures, so excluding them would move the all-flight share
   from 23.0% to 23.1%.
+- The route file uses `PBI` for the airport the summary and FAA file call `DJT`. The tools map it, so
+  route-file warnings and long-haul results use `DJT`.
 - BTS lookup tables confirm `AIRCRAFT_CONFIG` 1 is passenger configuration, 2 freight,
   3 combined passenger and freight, and 4 seaplane. `CLASS` F is scheduled passenger/cargo
   service, G scheduled all-cargo, and L non-scheduled civilian service.
@@ -74,8 +82,8 @@ passengers are 0.995–1.033 times FAA enplanements, with a median of 1.005.
 
 - `departures` includes freighters and cannot be filtered by aircraft type. In the
   2026 route file, passenger aircraft account for only 34.3% of US-carrier departures
-  at MEM and 54.5% at ANC, so passengers per flight and flight growth are distorted at
-  cargo-heavy airports.
+  at MEM and 54.5% at ANC, so passengers per departure and total departure growth are
+  distorted at cargo-heavy airports. See [METHODOLOGY.md](METHODOLOGY.md).
 - 2022, the 3-year base, was still a recovery year: national airport-level departures
   were 8.97M, against 10.23M in 2019 and 9.95M in 2025.
 

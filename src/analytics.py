@@ -1,4 +1,4 @@
-"""Deterministic airport analytics. No LLM calls and no investment scoring."""
+"""Deterministic airport analytics. No LLM calls. Scoring lives in scoring.py."""
 
 from __future__ import annotations
 
@@ -10,26 +10,45 @@ SCOPES = ("all", "passenger", "scheduled_passenger", "freighter")
 
 END_YEAR = config.LATEST_COMPLETE_YEAR
 BASE_YEARS = {3: config.BASE_YEAR_3Y, 10: config.BASE_YEAR_10Y}
+RANK_METRICS = {
+    "passenger_cagr": "passenger_cagr_pct",
+    "absolute_passenger_growth": "absolute_passenger_growth",
+}
 
 
 def annual_totals(summary: pd.DataFrame) -> pd.DataFrame:
-    """Sum the airport-month summary to one row per airport and calendar year."""
-    return summary.groupby(["airport", "year"]).agg(
+    """Sum the airport-month summary to one row per airport and calendar year.
+
+    A blank total is missing data, so it is counted here instead of being summed as zero.
+    """
+    measures = summary[["passengers", "departures", "seats"]]
+    return summary.assign(blank_month=measures.isna().any(axis=1)).groupby(["airport", "year"]).agg(
         passengers=("passengers", "sum"),
         departures=("departures", "sum"),
         seats=("seats", "sum"),
         freight_lbs=("freight_lbs", "sum"),
         domestic_departures=("domestic_departures", "sum"),
         months=("reporting_month", "nunique"),
+        blank_months=("blank_month", "sum"),
     )
 
 
 def complete_year(annual: pd.DataFrame, airport: str, year: int) -> pd.Series | None:
-    """Return a year's totals only if it has 12 months and positive activity."""
+    """Return a year's totals only with 12 reported months, no blanks and positive activity.
+
+    A reported month with zero passengers is a genuine zero. A month with no row
+    cannot be confirmed as zero activity from this source, so it counts as missing.
+    """
     if (airport, year) not in annual.index:
         return None
     row = annual.loc[(airport, year)]
-    usable = row["months"] == 12 and row["passengers"] > 0 and row["departures"] > 0 and row["seats"] > 0
+    usable = (
+        row["months"] == 12
+        and row["blank_months"] == 0
+        and row["passengers"] > 0
+        and row["departures"] > 0
+        and row["seats"] > 0
+    )
     return row if usable else None
 
 
@@ -37,8 +56,23 @@ def cagr_pct(end: float, start: float, years: int) -> float:
     return ((end / start) ** (1 / years) - 1) * 100
 
 
+def absolute_passenger_growth(annual: pd.DataFrame, airport: str, window_years: int) -> int | None:
+    """Passengers in the end year minus the base year, or None if either is incomplete."""
+    end = complete_year(annual, airport, END_YEAR)
+    base = complete_year(annual, airport, BASE_YEARS[window_years])
+    return None if end is None or base is None else int(end["passengers"]) - int(base["passengers"])
+
+
 def raw_metrics(annual: pd.DataFrame, airport: str) -> dict:
-    """Calculate the ten metrics as raw values, unweighted and not normalized.
+    """Report the 11 scored metrics for display, rounded and not normalized."""
+    return {
+        name: value if value is None or isinstance(value, int) else round(float(value), 2)
+        for name, value in metric_values(annual, airport).items()
+    }
+
+
+def metric_values(annual: pd.DataFrame, airport: str) -> dict:
+    """Calculate the 11 scored metrics as unrounded raw values.
 
     A metric is None when a year it needs is incomplete; nothing is imputed.
     """
@@ -64,9 +98,10 @@ def raw_metrics(annual: pd.DataFrame, airport: str) -> dict:
             end["passengers"] / end["departures"], base_3y["passengers"] / base_3y["departures"], 3
         )
 
-    metrics = {
+    return {
         "passenger_cagr_3y_pct": passengers_3y,
         "passenger_cagr_10y_pct": passengers_10y,
+        "absolute_passenger_growth_3y": absolute_passenger_growth(annual, airport, 3),
         "flight_cagr_3y_pct": flights_3y,
         "flight_cagr_10y_pct": flights_10y,
         "growth_gap_3y_pts": difference(passengers_3y, flights_3y),
@@ -76,7 +111,6 @@ def raw_metrics(annual: pd.DataFrame, airport: str) -> dict:
         "flight_growth_acceleration_pts": difference(flights_3y, flights_10y),
         "passenger_growth_acceleration_pts": difference(passengers_3y, passengers_10y),
     }
-    return {name: None if value is None else round(float(value), 2) for name, value in metrics.items()}
 
 
 def year_inputs(annual: pd.DataFrame, airport: str) -> dict:
@@ -147,13 +181,31 @@ def route_mix(routes: pd.DataFrame) -> pd.DataFrame:
     return mix
 
 
-def airport_warnings(mix: pd.DataFrame, airport: str, base_passengers: float | None = None) -> list[str]:
+def _small_base_warning(year: int, passengers: float) -> str:
+    return (
+        f"Small base year: {year} had {int(passengers):,} passengers, below the "
+        f"{config.SMALL_BASE_WARNING_PASSENGERS:,} threshold, so percentage growth may be inflated."
+    )
+
+
+def small_base_warnings(annual: pd.DataFrame, airport: str) -> list[str]:
+    """Flag every growth base year with few passengers. Flags never change a value or rank."""
+    warnings = []
+    for year in sorted(BASE_YEARS.values()):
+        if (airport, year) in annual.index:
+            passengers = annual.loc[(airport, year), "passengers"]
+            if passengers < config.SMALL_BASE_WARNING_PASSENGERS:
+                warnings.append(_small_base_warning(year, passengers))
+    return warnings
+
+
+def airport_warnings(
+    mix: pd.DataFrame, airport: str, base_passengers: float | None = None, base_year: int | None = None
+) -> list[str]:
     """Describe data conditions that can mislead, without changing any value."""
     warnings = []
     if base_passengers is not None and base_passengers < config.SMALL_BASE_WARNING_PASSENGERS:
-        warnings.append(
-            f"Small base year: {int(base_passengers):,} passengers, so percentage growth is inflated."
-        )
+        warnings.append(_small_base_warning(base_year, base_passengers))
     if airport in mix.index:
         row = mix.loc[airport]
         scheduled = row["scheduled_passenger_share_pct"]
@@ -165,7 +217,7 @@ def airport_warnings(mix: pd.DataFrame, airport: str, base_passengers: float | N
         if row["passenger_aircraft_share_pct"] < config.PASSENGER_AIRCRAFT_WARNING_PCT:
             warnings.append(
                 f"Only {row['passenger_aircraft_share_pct']:g}% of its Jan-Jul 2026 US-carrier departures "
-                "used passenger aircraft, so flight metrics are distorted by freighters."
+                "used passenger aircraft, so departure metrics are distorted by freighters."
             )
     return warnings
 
@@ -177,14 +229,17 @@ def rank_passenger_growth(
     window_years: int,
     min_enplanements: int,
     states: list[str] | None = None,
+    rank_by: str = "passenger_cagr",
 ) -> dict:
-    """Rank eligible airports by raw passenger CAGR, with ties broken by code.
+    """Rank eligible airports by passenger CAGR or absolute growth, with ties broken by code.
 
     National rank is set before any state filter, so a regional list still shows
     each airport's position in the full eligible group.
     """
     if window_years not in BASE_YEARS:
         raise ValueError(f"window_years must be one of {sorted(BASE_YEARS)}")
+    if rank_by not in RANK_METRICS:
+        raise ValueError(f"rank_by must be one of {sorted(RANK_METRICS)}")
     base_year = BASE_YEARS[window_years]
     eligible = airports[airports["enplanements_2025"] >= min_enplanements]
 
@@ -209,18 +264,20 @@ def rank_passenger_growth(
         record.update({
             f"passengers_{base_year}": int(base["passengers"]),
             f"passengers_{END_YEAR}": int(end["passengers"]),
+            "absolute_passenger_growth": int(end["passengers"]) - int(base["passengers"]),
             "passenger_cagr_pct": round(float(cagr_pct(end["passengers"], base["passengers"], window_years)), 2),
-            "warnings": airport_warnings(mix, row.t100_code, float(base["passengers"])),
+            "warnings": airport_warnings(mix, row.t100_code, float(base["passengers"]), base_year),
         })
         ranked.append(record)
 
-    ranked.sort(key=lambda item: (-item["passenger_cagr_pct"], item["airport"]))
+    ranked.sort(key=lambda item: (-item[RANK_METRICS[rank_by]], item["airport"]))
     for position, record in enumerate(ranked, start=1):
         record["national_rank"] = position
 
     selected = {state.upper() for state in states} if states else None
     keep = lambda record: selected is None or record["state"] in selected
     return {
+        "rank_by": rank_by,
         "window_years": window_years,
         "base_year": base_year,
         "end_year": END_YEAR,

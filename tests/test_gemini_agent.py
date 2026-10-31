@@ -94,8 +94,16 @@ def test_request_declares_every_tool_and_sets_automatic_mode():
     names = {item["name"] for item in body["tools"][0]["functionDeclarations"]}
     assert names == {tool["name"] for tool in tools.TOOL_DEFINITIONS}
     assert body["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
-    assert "Airport Opportunity Score is not implemented" in body["systemInstruction"]["parts"][0]["text"]
+    instruction = body["systemInstruction"]["parts"][0]["text"]
+    assert "preliminary screening proxy" in instruction
+    assert "Never calculate, approximate, adjust or reweight a score" in instruction
+    assert "35% of the score uses cargo-inclusive departure metrics" in instruction
+    assert "absolute passenger growth favors larger airports" in instruction
+    assert "Never call it a passenger load factor" in instruction
     assert body["generationConfig"]["maxOutputTokens"] > 0
+    declarations = {item["name"]: item for item in body["tools"][0]["functionDeclarations"]}
+    rank_by = declarations["rank_airports"]["parameters_json_schema"]["properties"]["rank_by"]
+    assert rank_by["enum"] == ["absolute_passenger_growth", "passenger_cagr"]
 
 
 def test_integer_enums_move_to_the_description_and_tools_stay_unchanged():
@@ -106,6 +114,19 @@ def test_integer_enums_move_to_the_description_and_tools_stay_unchanged():
     assert "Allowed values: 3, 10" in window["description"]
     assert "additionalProperties" not in schemas["rank_airports"]
     assert json.dumps(tools.TOOL_DEFINITIONS, sort_keys=True) == before
+
+
+def test_score_comes_from_the_python_tool_and_is_returned_to_the_model():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 1.0}),
+        text_reply("ILG scored 78.38."),
+    )
+    answer = make_agent(network).ask("Which airport has the highest score?")
+    assert answer.unverified_numbers == []
+    assert answer.tool_calls[0].result["ranked"][0]["airport"] == "ILG"
+    returned = network.bodies[1]["contents"][-1]["parts"][0]["functionResponse"]["response"]
+    assert returned["ranked"][0]["opportunity_score"] == 78.38
+    assert returned["disclaimer"].startswith("Preliminary screening proxy")
 
 
 def test_thought_signature_is_sent_back_unchanged():

@@ -99,16 +99,35 @@ def page_text(app):
     return "\n".join(str(part) for part in parts)
 
 
-def test_page_loads_with_score_label_and_makes_no_network_call(run_app):
+def evidence_expanders(app):
+    return [item for item in app.expander if item.label.startswith("Evidence")]
+
+
+def test_page_loads_with_score_disclaimer_and_makes_no_network_call(run_app):
     network = FakeNetwork()
     app = run_app(network)
-    assert "Airport Opportunity Score: not yet implemented" in app.info[0].value
+    banner = app.info[0].value
+    assert "Airport Opportunity Score: Preliminary screening proxy" in banner
+    assert "35% of the score uses cargo-inclusive departure metrics" in banner
+    assert "favors larger airports" in banner
+    assert "2022 base year was still in recovery" in banner
     assert network.keys_seen == []
 
 
-def test_four_example_types_are_offered(run_app):
+def test_methodology_lists_all_11_weights(run_app):
+    app = run_app(FakeNetwork())
+    table = next(frame.value for frame in app.dataframe if "Weight (%)" in frame.value.columns)
+    assert len(table) == 11
+    assert table["Weight (%)"].sum() == 100
+    weights = dict(zip(table["Measure"], table["Weight (%)"]))
+    assert weights["Absolute Passenger Growth 3Y (passengers)"] == 10
+    assert weights["Passenger CAGR 3Y (%)"] == 15
+    assert weights["Total Load Factor 2025 (%), passengers / seats"] == 15
+
+
+def test_five_example_types_are_offered(run_app):
     labels = " ".join(item.label for item in run_app(FakeNetwork()).button)
-    for example in ("Airport ranking", "Airport comparison", "Airport profile", "Long-haul analysis"):
+    for example in ("Airport Opportunity Score", "Airport ranking", "Airport comparison", "Airport profile", "Long-haul analysis"):
         assert example in labels
 
 
@@ -172,8 +191,9 @@ def test_comparison_shows_answer_and_python_evidence(run_app):
 
     assert network.generate_calls == 2
     assert "SNA had 19.2%" in page_text(app)
-    assert app.expander[0].label.startswith("Evidence, sources and caveats")
-    assert app.expander[0].proto.expanded
+    evidence = evidence_expanders(app)
+    assert evidence[0].label.startswith("Evidence, sources and caveats")
+    assert evidence[0].proto.expanded
     assert [tab.label for tab in app.tabs[:5]] == ["Results", "Definitions", "Sources", "Caveats", "Raw"]
     assert not app.warning or "do not match" not in page_text(app)
     congestion = next(frame.value for frame in app.dataframe if "Average taxi-out (min)" in set(frame.value["Measure"]))
@@ -202,7 +222,86 @@ def test_all_four_tools_render(run_app):
     assert any("National rank" in item for item in columns)
     assert any("SFO" in item for item in columns)
     assert any("Share at 3000+ miles (%)" in item for item in columns)
-    assert len(app.expander) == 3
+    assert len(evidence_expanders(app)) == 3
+
+
+def test_score_ranking_shows_context_warnings_and_disclaimers(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 25}),
+        text_reply("ILG scored 78.38."),
+    )
+    app = ask(connect(run_app(network)), "Highest scores?")
+    table = next(frame.value for frame in app.dataframe if "Airport Opportunity Score" in frame.value.columns)
+    first = table.iloc[0]
+    assert first["Airport"] == "ILG"
+    assert first["Airport Opportunity Score"] == 78.38
+    assert first["Passengers 2022"] == 4988
+    assert first["Passengers 2025"] == first["Passengers 2022"] + first["Absolute Passenger Growth 3Y"]
+    assert first["Passenger CAGR 3Y (%)"] == 223.74
+    assert first["Base-year warning"] == "Small base"
+    assert table[table["Airport"] == "PAE"].iloc[0]["Base-year warning"] == "Small base"
+    warnings = " ".join(item.value for item in app.warning)
+    assert "ILG: Small base year: 2022 had 4,988 passengers" in warnings
+    assert "PAE: Small base year: 2015 had 92 passengers" in warnings
+    assert "Preliminary screening proxy" in warnings
+    assert any("Absolute Passenger Growth 3Y (passengers)" in set(frame.value.get("Measure", [])) for frame in app.dataframe)
+
+
+def test_small_base_warning_is_shown_outside_the_collapsed_evidence(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "ILG"}), text_reply("First."),
+        function_call("get_airport_profile", {"airport": "SFO"}), text_reply("Second."),
+    )
+    app = ask(ask(connect(run_app(network)), "ILG?"), "SFO?")
+    assert any(item.value.startswith("ILG: Small base year") for item in app.warning)
+
+
+def test_filtered_score_ranking_keeps_the_national_rank(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": ["DE"], "top_n": 5}),
+        text_reply("ILG scored 78.38."),
+    )
+    app = ask(connect(run_app(network)), "Delaware score?")
+    table = next(frame.value for frame in app.dataframe if "Airport Opportunity Score" in frame.value.columns)
+    assert table.iloc[0]["National rank"] == 1
+    assert table.iloc[0]["Airport Opportunity Score"] == 78.38
+
+
+def test_profile_shows_the_score_table_with_passenger_context(run_app):
+    network = FakeNetwork(function_call("get_airport_profile", {"airport": "ATL"}), text_reply("ATL scored 50.66."))
+    app = ask(connect(run_app(network)), "ATL?")
+    table = next(
+        frame.value for frame in app.dataframe
+        if "Airport Opportunity Score" in set(frame.value.get("Measure", []))
+    ).set_index("Measure")["ATL"]
+    assert table["Airport Opportunity Score"] == 50.66
+    assert table["National rank"] == 82
+    assert table["Absolute Passenger Growth 3Y"] == 5924745
+    assert table["Passenger CAGR 3Y (%)"] == 4.16
+    assert table["Passengers 2025"] - table["Passengers 2022"] == 5924745
+
+
+def test_airport_without_a_score_says_why(run_app):
+    network = FakeNetwork(function_call("get_airport_profile", {"airport": "JAC"}), text_reply("JAC has no score."))
+    app = ask(connect(run_app(network)), "JAC?")
+    assert "JAC has no score: 2022 is incomplete: 11 of 12 months reported." in page_text(app)
+
+
+def test_absolute_ranking_is_labelled_and_keeps_cagr_visible(run_app):
+    network = FakeNetwork(
+        function_call("rank_airports", {
+            "window_years": 3, "states": [], "top_n": 3, "min_enplanements": 100000,
+            "rank_by": "absolute_passenger_growth",
+        }),
+        text_reply("ORD added the most passengers."),
+    )
+    app = ask(connect(run_app(network)), "Most passengers added?")
+    table = next(frame.value for frame in app.dataframe if "Absolute Passenger Growth 3Y" in frame.value.columns)
+    assert table.iloc[0]["Airport"] == "ORD"
+    assert table.iloc[0]["Passenger CAGR 3Y (%)"] == 7.11
+    text = page_text(app)
+    assert "Ranked by Absolute Passenger Growth 3Y" in text
+    assert "tends to favor larger airports" in text
 
 
 def test_newest_answer_appears_first_and_only_it_is_expanded(run_app):
@@ -213,7 +312,7 @@ def test_newest_answer_appears_first_and_only_it_is_expanded(run_app):
     app = ask(ask(connect(run_app(network)), "First"), "Second")
     text = page_text(app)
     assert text.index("Second answer.") < text.index("First answer.")
-    assert [item.proto.expanded for item in app.expander] == [True, False]
+    assert [item.proto.expanded for item in evidence_expanders(app)] == [True, False]
 
 
 def test_invented_number_warning_is_shown(run_app):
@@ -297,7 +396,7 @@ def test_disconnect_clears_the_connection_and_conversation(run_app):
     button(app, "Disconnect").click().run()
     assert app.session_state["agent"] is None
     assert app.session_state["history"] == []
-    assert not list(app.expander)
+    assert not evidence_expanders(app)
 
 
 def test_dollar_signs_are_shown_literally():
@@ -307,11 +406,12 @@ def test_dollar_signs_are_shown_literally():
 def test_presentation_copies_tool_values_exactly():
     result = tools.compare_airports(["LAX", "SNA"])
     evidence = presentation.build_evidence(ToolCall("compare_airports", {"airports": ["LAX", "SNA"]}, result, False))
-    demand = evidence.tables[0].data
-    row = demand[demand["Measure"] == "Total Load Factor 2025 (%)"].iloc[0]
+    demand = next(table.data for table in evidence.tables if table.title == "Demand-pressure proxies")
+    row = demand[demand["Measure"] == "Total Load Factor 2025 (%), passengers / seats"].iloc[0]
     assert row["LAX"] == result["airports"]["LAX"]["demand_pressure_proxies"]["metrics"]["total_load_factor_2025_pct"]
     assert {table.title for table in evidence.tables} == {
-        "Demand-pressure proxies", "Operational congestion", "Cargo context, not scored"
+        "Airport Opportunity Score", "Score points by metric", "Demand-pressure proxies",
+        "Operational congestion", "Cargo context, not scored",
     }
     assert evidence.provisional and all(item.startswith("PROVISIONAL") for item in evidence.provisional)
     assert json.dumps(evidence.raw, default=float)

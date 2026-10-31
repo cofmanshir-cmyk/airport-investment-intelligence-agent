@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import config, tools
-from src.agent import Agent, AgentError, MAX_TOOL_ROUNDS, find_unverified_numbers
+from src import cli, config, tools
+from src.agent import Agent, AgentError, Answer, MAX_TOOL_ROUNDS, ToolCall, find_unverified_numbers
 
 pytestmark = pytest.mark.skipif(
     not (config.PROCESSED_DIR / "ontime_airport_month.parquet").exists(),
@@ -57,6 +57,14 @@ def test_tool_result_comes_from_python_and_returns_to_the_llm():
     assert returned["tool_use_id"] == "toolu_1"
     assert returned["is_error"] is False
     assert '"share_pct": 2.6' in returned["content"]
+
+
+def test_command_line_evidence_shows_score_disclaimer_and_small_base_warning():
+    result = tools.rank_opportunity_score(["DE"], 1)
+    answer = Answer("ILG scored 78.38.", [ToolCall("rank_opportunity_score", {"states": ["DE"], "top_n": 1}, result, False)])
+    text = cli.render_evidence(answer)
+    assert "Preliminary screening proxy" in text
+    assert "WARNING: ILG: Small base year: 2022 had 4,988 passengers" in text
 
 
 def test_invented_number_is_flagged():

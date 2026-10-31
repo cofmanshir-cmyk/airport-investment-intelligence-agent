@@ -3,8 +3,8 @@
 Ask airport investment questions in plain English. A real LLM chooses a deterministic Python
 tool, the tool calculates the result on public BTS and FAA data, and the LLM explains it.
 
-This is a working demo. **The Airport Opportunity Score is not implemented**, and results are
-screening indicators, not investment advice or return forecasts.
+This is a working demo. The **Airport Opportunity Score** is a preliminary screening proxy, not
+investment advice or a return forecast. See [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Try it
 
@@ -49,6 +49,8 @@ nothing is sent until you select **Ask**.
 
 ## Example questions
 
+- Which airports have the highest Airport Opportunity Score?
+- Which airports added the most passengers over 3 years?
 - Which airports have the fastest 3-year passenger growth?
 - Rank New England airports by 10-year passenger growth.
 - Compare LAX and SNA congestion.
@@ -66,6 +68,7 @@ as JSON, or `/quit` to exit.
 | LLM loop | `src/agent.py` | The LLM selects tools and explains; unmatched numbers are flagged |
 | Tools | `src/tools.py` | Validate inputs and attach definitions, sources and caveats |
 | Calculations | `src/analytics.py` | Deterministic Python, with no LLM calls |
+| Score | `src/scoring.py` | 11 weighted metrics against a fixed national peer group |
 | Data | `src/pipeline.py` | Fetches, validates and snapshots public data |
 
 The number check flags figures to review. It can't prove an explanation is right, so compare
@@ -73,14 +76,17 @@ important results with `/raw`.
 
 ## Provisional and unavailable
 
-- **Flight metrics include freighters.** The agreed passenger-only definition needs historical
-  T-100 All Carriers route data, which isn't loaded yet.
+- **Departure metrics include cargo flights.** They make up 35% of the score.
+- **Absolute passenger growth favors larger airports.** Read it alongside Passenger CAGR.
+- **2022 was a recovery year,** which may inflate 3-year growth.
+- **Small base years are flagged, not excluded.** ILG and PAE are examples.
 - **Eligibility:** the 100,000 enplanement threshold is provisional.
-- **Incomplete years:** shown as null under a strict 12-month rule. This decision is open.
-- **Service class:** class F versus F+L is open, and passenger totals include all classes.
-- **Not measured:** terminal capacity, unmet demand and profitability.
+- **Incomplete years:** shown as null, and an airport missing a scored metric gets no score.
+- **Service class:** passenger totals include all classes.
+- **Not measured:** passenger-only capacity, terminal capacity, unmet demand, profitability and returns.
 
-See [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) for sources and limitations.
+See [docs/METHODOLOGY.md](docs/METHODOLOGY.md) for the score and
+[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) for sources and limitations.
 
 ## Tests
 
