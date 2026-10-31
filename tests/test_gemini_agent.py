@@ -96,10 +96,15 @@ def test_request_declares_every_tool_and_sets_automatic_mode():
     assert body["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
     instruction = body["systemInstruction"]["parts"][0]["text"]
     assert "preliminary screening proxy" in instruction
-    assert "Never calculate, approximate, adjust or reweight a score" in instruction
+    assert "Never calculate, approximate, adjust, rescale or reweight a score" in instruction
+    assert "never a probability" in instruction
     assert "35% of the score uses cargo-inclusive departure metrics" in instruction
     assert "absolute passenger growth favors larger airports" in instruction
     assert "Never call it a passenger load factor" in instruction
+    assert "120 to 180 words" in instruction
+    assert "Never write a table" in instruction
+    assert "Never add a passenger threshold" in instruction
+    assert "terminal capacity" in instruction
     assert body["generationConfig"]["maxOutputTokens"] > 0
     declarations = {item["name"]: item for item in body["tools"][0]["functionDeclarations"]}
     rank_by = declarations["rank_airports"]["parameters_json_schema"]["properties"]["rank_by"]
@@ -127,6 +132,68 @@ def test_score_comes_from_the_python_tool_and_is_returned_to_the_model():
     returned = network.bodies[1]["contents"][-1]["parts"][0]["functionResponse"]["response"]
     assert returned["ranked"][0]["opportunity_score"] == 78.38
     assert returned["disclaimer"].startswith("Preliminary screening proxy")
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["Which airports should we investigate for terminal expansion?", "What is the load factor at SFO?", "Compare LAX and SNA."],
+)
+def test_every_question_is_offered_all_tools_in_automatic_mode(question):
+    network = FakeNetwork(text_reply("Answer."))
+    make_agent(network).ask(question)
+    body = network.bodies[0]
+    assert {item["name"] for item in body["tools"][0]["functionDeclarations"]} == {
+        tool["name"] for tool in tools.TOOL_DEFINITIONS
+    }
+    assert body["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
+    assert "allowedFunctionNames" not in body["toolConfig"]["functionCallingConfig"]
+
+
+def test_model_can_combine_tools_in_one_turn():
+    network = FakeNetwork(
+        {"candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"id": "a", "name": "rank_opportunity_score", "args": {"states": [], "top_n": 3}}},
+            {"functionCall": {"id": "b", "name": "compare_airports", "args": {"airports": ["LAX", "SNA"], "table_sections": ["congestion"]}}},
+        ]}, "finishReason": "STOP"}]},
+        text_reply("Combined answer."),
+    )
+    answer = make_agent(network).ask("Growth and congestion?")
+    assert [call.name for call in answer.tool_calls] == ["rank_opportunity_score", "compare_airports"]
+    assert len(network.bodies[1]["contents"][-1]["parts"]) == 2
+
+
+def test_model_can_use_tools_across_rounds():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 1}),
+        function_call("get_airport_profile", {"airport": "ILG", "table_sections": []}),
+        text_reply("Done."),
+    )
+    answer = make_agent(network).ask("Top airport, then its detail?")
+    assert [call.name for call in answer.tool_calls] == ["rank_opportunity_score", "get_airport_profile"]
+
+
+def test_follow_up_sends_earlier_constraints_to_the_model():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3, "min_passengers_2025": 2000000, "passenger_comparison": "over"}),
+        text_reply("First."),
+        text_reply("Second."),
+    )
+    agent = make_agent(network)
+    agent.ask("Top airports with over 2 million passengers?")
+    agent.ask("And what about in Texas?")
+    earlier = json.dumps(network.bodies[2]["contents"])
+    assert "over 2 million passengers" in earlier
+    assert '"min_passengers_2025": 2000000' in earlier
+
+
+def test_whole_number_float_threshold_from_the_model_is_accepted():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 2.0, "min_passengers_2025": 2000000.0, "passenger_comparison": "over"}),
+        text_reply("Done."),
+    )
+    call = make_agent(network).ask("Over 2 million?").tool_calls[0]
+    assert not call.is_error
+    assert call.result["filters"]["passengers_2025"] == "Over 2,000,000 2025 departing passengers"
 
 
 def test_thought_signature_is_sent_back_unchanged():

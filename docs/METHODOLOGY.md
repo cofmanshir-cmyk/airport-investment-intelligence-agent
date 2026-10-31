@@ -55,6 +55,20 @@ national rank. The 100,000 threshold is provisional.
 
 In the current snapshot, 229 of 233 eligible airports are scored.
 
+## Display filters
+
+State and passenger filters only change which airports are shown. They do not change the 11 metrics,
+weights, peer group, normalization limits, scores or national ranks. A filtered list can show a separate
+"Position in this list".
+
+The optional passenger filter uses **2025 departing passengers** from T-100, which is about half of total
+two-way traffic. Any non-negative whole number is accepted, with "at least" and "over" kept distinct. The app
+offers presets for 500,000, 1 million, 5 million and 10 million. No filter applies by default, including for
+terminal-expansion questions.
+
+Scores are points out of 100. They are not probabilities or chances of success, and they are never rescaled
+so that the top airport reaches 100.
+
 ## Missing data
 
 | Month in the source | Treatment |

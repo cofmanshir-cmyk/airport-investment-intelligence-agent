@@ -51,6 +51,7 @@ nothing is sent until you select **Ask**.
 
 - Which airports have the highest Airport Opportunity Score?
 - Which airports added the most passengers over 3 years?
+- Which airports with over 2 million departing passengers score highest?
 - Which airports have the fastest 3-year passenger growth?
 - Rank New England airports by 10-year passenger growth.
 - Compare LAX and SNA congestion.
@@ -70,6 +71,9 @@ as JSON, or `/quit` to exit.
 | Calculations | `src/analytics.py` | Deterministic Python, with no LLM calls |
 | Score | `src/scoring.py` | 11 weighted metrics against a fixed national peer group |
 | Data | `src/pipeline.py` | Fetches, validates and snapshots public data |
+
+Answers lead with a short conclusion. Results tables are built in Python from tool output, and the
+LLM writes only the interpretation. Full evidence stays in a collapsed section.
 
 The number check flags figures to review. It can't prove an explanation is right, so compare
 important results with `/raw`.

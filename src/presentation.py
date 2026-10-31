@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -56,13 +57,17 @@ RANK_COLUMNS = {
     "faa_enplanements_2025": "FAA enplanements 2025",
 }
 
+SCORE_LABEL = "Score (points out of 100)"
+POSITION_LABEL = "Position in this list"
+
 SCORE_COLUMNS = {
     "national_rank": "National rank",
+    "position_in_this_list": POSITION_LABEL,
     "airport": "Airport",
     "airport_name": "Name",
     "state": "State",
     "faa_hub_class": "FAA hub class",
-    "opportunity_score": "Airport Opportunity Score",
+    "opportunity_score": SCORE_LABEL,
     "passengers_2022": "Passengers 2022",
     "passengers_2025": "Passengers 2025",
     "absolute_passenger_growth_3y": "Absolute Passenger Growth 3Y",
@@ -112,14 +117,23 @@ def _section_table(title: str, columns: dict[str, dict | None], note: str = "") 
     return Table(title, frame.reset_index(), note)
 
 
+def _rank_label(rank: int | None, total: int) -> str:
+    return "n/a" if rank is None else f"#{rank} of {total}"
+
+
+def _display(value, pattern: str = "{:,}") -> str:
+    return "n/a" if value is None else pattern.format(value)
+
+
 def _score_summary(section: dict) -> dict:
+    """Format each value as text, because this table mixes scores, ranks and counts."""
     return {
-        "Airport Opportunity Score": section["opportunity_score"],
-        "National rank": section["national_rank"],
-        "Passengers 2022": section["passengers_2022"],
-        "Passengers 2025": section["passengers_2025"],
-        "Absolute Passenger Growth 3Y": section["absolute_passenger_growth_3y"],
-        "Passenger CAGR 3Y (%)": section["passenger_cagr_3y_pct"],
+        SCORE_LABEL: _display(section["opportunity_score"], "{:.2f}"),
+        "National rank": _rank_label(section["national_rank"], section["national_peer_count"]),
+        "Passengers 2022": _display(section["passengers_2022"]),
+        "Passengers 2025": _display(section["passengers_2025"]),
+        "Absolute Passenger Growth 3Y": _display(section["absolute_passenger_growth_3y"]),
+        "Passenger CAGR 3Y (%)": _display(section["passenger_cagr_3y_pct"], "{:.2f}"),
     }
 
 
@@ -142,7 +156,7 @@ def _score_tables(profiles: dict[str, dict]) -> list[Table]:
     return tables
 
 
-def _airport_tables(profiles: dict[str, dict]) -> list[Table]:
+def _airport_sections(profiles: dict[str, dict]) -> dict[str, list[Table]]:
     """Keep the score, demand, congestion and cargo in separate tables."""
     congestion = {code: profile["operational_congestion"] for code, profile in profiles.items()}
     congestion_rows = {
@@ -152,9 +166,9 @@ def _airport_tables(profiles: dict[str, dict]) -> list[Table]:
     years = {section["year"] for section in congestion.values() if section}
     year_note = f"Calendar {years.pop()}." if len(years) == 1 else ""
     cargo = {code: profile["cargo_context_not_scored"] for code, profile in profiles.items()}
-    tables = [
-        *_score_tables(profiles),
-        _section_table(
+    sections = {
+        "score": _score_tables(profiles),
+        "demand": [_section_table(
             "Demand-pressure proxies",
             {
                 code: {
@@ -165,21 +179,31 @@ def _airport_tables(profiles: dict[str, dict]) -> list[Table]:
             },
             "Raw values, not normalized. Total departure metrics include cargo flights. They do not measure "
             "congestion, terminal capacity, unmet demand or profitability. Blank means a required year is incomplete.",
-        ),
-        _section_table(
+        )],
+        "congestion": [_section_table(
             "Operational congestion",
             congestion_rows,
             f"{year_note} Separate from the demand proxies; the two are never merged.".strip(),
-        ),
-        _section_table(
+        )],
+        "cargo": [_section_table(
             "Cargo context, not scored",
             {
                 code: {"Freight (lbs)": section["freight_lbs"]} if section else None
                 for code, section in cargo.items()
             },
-        ),
-    ]
-    return [table for table in tables if table is not None]
+        )],
+    }
+    return {name: [table for table in tables if table is not None] for name, tables in sections.items()}
+
+
+def _airport_tables(profiles: dict[str, dict]) -> list[Table]:
+    return [table for tables in _airport_sections(profiles).values() for table in tables]
+
+
+def _filter_note(filters: dict) -> str:
+    states = filters["states"]
+    states_text = "all states" if states == "all" else ", ".join(states)
+    return f"Shown: {filters['passengers_2025']}; {states_text}. Filters do not change scores or national ranks."
 
 
 def _annual_inputs_table(airport: str, profile: dict) -> Table:
@@ -191,22 +215,33 @@ def _annual_inputs_table(airport: str, profile: dict) -> Table:
 
 def _rank_evidence(result: dict) -> tuple[list[Table], list[str]]:
     base, end, window = result["base_year"], result["end_year"], result["window_years"]
-    columns = {
-        **RANK_COLUMNS,
-        f"passengers_{base}": f"Passengers {base}",
-        f"passengers_{end}": f"Passengers {end}",
+    absolute = result["rank_by"] == "absolute_passenger_growth"
+    growth = {
         "absolute_passenger_growth": f"Absolute Passenger Growth {window}Y",
         "passenger_cagr_pct": f"Passenger CAGR {window}Y (%)",
     }
-    absolute = result["rank_by"] == "absolute_passenger_growth"
+    # The ranked measure comes first after the airport's identity.
+    measures = list(growth.items()) if absolute else list(reversed(growth.items()))
+    columns = {
+        "national_rank": "National rank",
+        **({"position_in_this_list": POSITION_LABEL} if any("position_in_this_list" in row for row in result["ranked"]) else {}),
+        "airport": "Airport",
+        "airport_name": "Name",
+        "state": "State",
+        "faa_hub_class": "FAA hub class",
+        **dict(measures),
+        f"passengers_{base}": f"Passengers {base}",
+        f"passengers_{end}": f"Passengers {end}",
+    }
     tables = []
     if result["ranked"]:
-        ranked = pd.DataFrame(result["ranked"]).reindex(columns=list(columns)).rename(columns=columns)
+        total = result["airports_in_national_ranking"]
+        rows = [{**row, "national_rank": _rank_label(row["national_rank"], total)} for row in result["ranked"]]
+        ranked = pd.DataFrame(rows).reindex(columns=list(columns)).rename(columns=columns)
         tables.append(Table(
             f"Ranked by Absolute Passenger Growth {window}Y" if absolute else f"Ranked by Passenger CAGR {window}Y",
             ranked,
-            f"One raw metric among all {result['airports_in_national_ranking']} ranked airports, "
-            "not an investment ranking."
+            f"One raw metric, not an investment ranking. {_filter_note(result['filters'])}"
             + (" Absolute growth tends to favor larger airports." if absolute else ""),
         ))
     if result["not_ranked"]:
@@ -223,15 +258,24 @@ def _rank_evidence(result: dict) -> tuple[list[Table], list[str]]:
 def _opportunity_evidence(result: dict) -> tuple[list[Table], list[str]]:
     tables, warnings = [], []
     if result["ranked"]:
+        total = result["airports_scored_nationally"]
         rows = [
-            {**row, "base_year_warning": "Small base" if row["small_base_warnings"] else ""}
+            {
+                **row,
+                "national_rank": _rank_label(row["national_rank"], total),
+                "base_year_warning": "Small base" if row["small_base_warnings"] else "",
+            }
             for row in result["ranked"]
         ]
+        columns = {
+            key: label
+            for key, label in SCORE_COLUMNS.items()
+            if key != "position_in_this_list" or "position_in_this_list" in rows[0]
+        }
         tables.append(Table(
             "Airport Opportunity Score",
-            pd.DataFrame(rows).reindex(columns=list(SCORE_COLUMNS)).rename(columns=SCORE_COLUMNS),
-            f"National ranks among all {result['airports_scored_nationally']} scored airports. "
-            "Filters do not change scores or ranks.",
+            pd.DataFrame(rows).reindex(columns=list(columns)).rename(columns=columns),
+            _filter_note(result["filters"]),
         ))
         points = {row["airport"]: row["score_points"] for row in result["ranked"]}
         tables.append(_section_table("Score points by metric", points, "Points = weight x normalized value / 100."))
@@ -256,7 +300,7 @@ def methodology_table() -> pd.DataFrame:
 
 
 def small_base_alerts(calls: list[ToolCall]) -> list[str]:
-    """Collect small-base warnings so they can be shown beside the answer."""
+    """Collect full small-base warnings for the evidence section."""
     alerts = [
         warning
         for call in calls
@@ -264,6 +308,56 @@ def small_base_alerts(calls: list[ToolCall]) -> list[str]:
         if SMALL_BASE_PREFIX in warning
     ]
     return list(dict.fromkeys(alerts))
+
+
+def split_answer(text: str) -> tuple[str, str]:
+    """Separate the first paragraph from the rest, so the table can sit between them.
+
+    Results tables come only from tool output, so any table the model writes is removed.
+    """
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("|")]
+    parts = re.split(r"\n\s*\n", "\n".join(lines).strip(), maxsplit=1)
+    return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
+
+
+def main_tables(calls: list[ToolCall]) -> list[Table]:
+    """Choose the results table for each tool, from its own output."""
+    tables = []
+    for call in calls:
+        if call.is_error:
+            continue
+        result = call.result
+        if call.name == "rank_opportunity_score":
+            tables += _opportunity_evidence(result)[0][:1] if result["ranked"] else []
+        elif call.name == "rank_airports":
+            tables += _rank_evidence(result)[0][:1] if result["ranked"] else []
+        elif call.name in ("compare_airports", "get_airport_profile"):
+            profiles = result["airports"] if call.name == "compare_airports" else {result["profile"]["airport"]: result["profile"]}
+            sections = _airport_sections(profiles)
+            # A comparison needs a table by default; one airport's fact often does not.
+            chosen = result.get("table_sections")
+            if chosen is None:
+                chosen = list(sections) if call.name == "compare_airports" else []
+            tables += [sections[name][0] for name in chosen if sections[name]]
+    return tables
+
+
+def small_base_notice(calls: list[ToolCall], narrative: str) -> str | None:
+    """Return one short warning for small-base airports the narrative does not warn about."""
+    paragraphs = re.split(r"\n\s*\n", narrative)
+    years: dict[str, list[str]] = {}
+    for alert in small_base_alerts(calls):
+        match = re.match(r"(\w+): Small base year: (\d{4}) had ([\d,]+) passengers", alert)
+        if match:
+            years.setdefault(match[1], []).append(f"{match[2]}: {match[3]}")
+    missing = [
+        f"{code} ({'; '.join(values)} passengers)"
+        for code, values in years.items()
+        if not any(re.search(rf"\b{code}\b", part) and re.search(r"small[- ]base", part, re.I) for part in paragraphs)
+    ]
+    if not missing:
+        return None
+    return f"Small base year: {', '.join(missing)}. Percentage growth may be inflated."
 
 
 def _long_haul_evidence(result: dict) -> tuple[list[Table], list[str]]:

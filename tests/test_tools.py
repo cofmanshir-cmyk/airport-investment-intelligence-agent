@@ -194,6 +194,90 @@ def test_state_filter_also_limits_unscored_airports():
     assert tools.rank_opportunity_score(["DE"], 25)["not_scored"] == []
 
 
+def passengers_2025(code):
+    return int(tools._annual().loc[(code, 2025), "passengers"])
+
+
+def test_score_ranking_defaults_to_all_eligible_airports():
+    result = tools.rank_opportunity_score([], 25)
+    assert result["filters"]["passengers_2025"] == "All eligible airports"
+    assert result["airports_matching_filters"] == 229
+    assert "ILG" in {row["airport"] for row in result["ranked"]}
+    assert all("position_in_this_list" not in row for row in result["ranked"])
+
+
+@pytest.mark.parametrize("minimum", [500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, 1_234_567])
+def test_any_passenger_threshold_filters_without_changing_scores_or_ranks(minimum):
+    national = {row["airport"]: row for row in tools._scores()["scored"]}
+    limits_before = dict(tools._scores()["bounds"])
+    result = tools.rank_opportunity_score([], 25, minimum)
+    assert result["ranked"]
+    expected = sum(passengers_2025(code) >= minimum for code in national)
+    assert result["airports_matching_filters"] == expected
+    assert result["airports_scored_nationally"] == 229
+    assert result["normalization_limits"] == limits_before
+    assert f"At least {minimum:,} 2025 departing passengers" == result["filters"]["passengers_2025"]
+    for position, row in enumerate(result["ranked"], start=1):
+        assert row["passengers_2025"] >= minimum
+        assert row["opportunity_score"] == national[row["airport"]]["opportunity_score"]
+        assert row["national_rank"] == national[row["airport"]]["national_rank"]
+        assert row["position_in_this_list"] == position
+
+
+def test_over_excludes_the_exact_threshold_and_at_least_includes_it():
+    exact = passengers_2025("SFO")
+    at_least = tools.rank_opportunity_score(["CA"], 25, exact, "at_least")["ranked"]
+    over = tools.rank_opportunity_score(["CA"], 25, exact, "over")["ranked"]
+    assert "SFO" in {row["airport"] for row in at_least}
+    assert "SFO" not in {row["airport"] for row in over}
+    assert tools.rank_opportunity_score(["CA"], 25, exact, "over")["filters"]["passengers_2025"].startswith("Over ")
+
+
+def test_passenger_filter_works_with_states_and_top_n():
+    full = tools.rank_opportunity_score(["CA", "TX"], 25, 2_000_000)
+    limited = tools.rank_opportunity_score(["CA", "TX"], 2, 2_000_000)
+    assert len(limited["ranked"]) == 2
+    assert limited["airports_matching_filters"] == full["airports_matching_filters"]
+    assert limited["ranked"][0]["airport"] == full["ranked"][0]["airport"]
+    assert [row["position_in_this_list"] for row in limited["ranked"]] == [1, 2]
+    assert all(row["state"] in ("CA", "TX") and row["passengers_2025"] >= 2_000_000 for row in full["ranked"])
+    national_ranks = [row["national_rank"] for row in full["ranked"]]
+    assert national_ranks == sorted(national_ranks) and national_ranks[0] > 1
+
+
+def test_filtering_leaves_the_national_results_unchanged():
+    before = tools.rank_opportunity_score([], 25)["ranked"]
+    tools.rank_opportunity_score(["CA"], 5, 10_000_000, "over")
+    assert tools.rank_opportunity_score([], 25)["ranked"] == before
+
+
+def test_passenger_filter_also_limits_unscored_airports():
+    assert "JAC" in {row["airport"] for row in tools.rank_opportunity_score(["WY"], 25, 500_000)["not_scored"]}
+    assert tools.rank_opportunity_score(["WY"], 25, 1_000_000)["not_scored"] == []
+
+
+def test_growth_ranking_supports_passenger_filter_and_keeps_national_rank():
+    national = {row["airport"]: row["national_rank"] for row in tools.rank_airports(3, [], 25, 100_000, "absolute_passenger_growth")["ranked"]}
+    result = tools.rank_airports(3, ["CA"], 25, 100_000, "absolute_passenger_growth", 2_000_000, "over")
+    assert result["filters"]["passengers_2025"] == "Over 2,000,000 2025 departing passengers"
+    assert all(row["passengers_2025"] > 2_000_000 and row["state"] == "CA" for row in result["ranked"])
+    assert next(row for row in result["ranked"] if row["airport"] == "SFO")["national_rank"] == national["SFO"]
+    assert result["ranked"][0]["position_in_this_list"] == 1
+
+
+def test_passenger_filter_schema_allows_any_whole_number():
+    for name in ("rank_opportunity_score", "rank_airports"):
+        schema = next(tool for tool in tools.TOOL_DEFINITIONS if tool["name"] == name)["input_schema"]["properties"]
+        assert schema["min_passengers_2025"]["type"] == "integer"
+        assert "enum" not in schema["min_passengers_2025"]
+        assert schema["passenger_comparison"]["enum"] == ["at_least", "over"]
+
+
+def test_table_sections_are_returned_for_display():
+    assert tools.compare_airports(["LAX", "SNA"], ["congestion"])["table_sections"] == ["congestion"]
+    assert tools.get_airport_profile("SFO", [])["table_sections"] == []
+
+
 def test_score_results_disclose_the_required_limits():
     for result in (tools.rank_opportunity_score([], 1), tools.get_airport_profile("BOS"), tools.compare_airports(["LAX", "SNA"])):
         text = " ".join([result["disclaimer"], *result["caveats"]])
@@ -249,6 +333,12 @@ def test_faa_code_is_accepted():
         ("rank_airports", {"window_years": 3, "states": [], "top_n": 5, "min_enplanements": 100000, "rank_by": "size"}),
         ("rank_opportunity_score", {"states": [], "top_n": 500}),
         ("rank_opportunity_score", {"states": ["XX"], "top_n": 5}),
+        ("rank_opportunity_score", {"states": [], "top_n": 5, "min_passengers_2025": -1}),
+        ("rank_opportunity_score", {"states": [], "top_n": 5, "min_passengers_2025": 1500.5}),
+        ("rank_opportunity_score", {"states": [], "top_n": 5, "min_passengers_2025": 1000, "passenger_comparison": "under"}),
+        ("rank_airports", {"window_years": 3, "states": [], "top_n": 5, "min_enplanements": 100000, "min_passengers_2025": -1}),
+        ("get_airport_profile", {"airport": "SFO", "table_sections": ["everything"]}),
+        ("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["everything"]}),
         ("get_long_haul_share", {"airport": "ANC", "threshold_miles": 0}),
         ("no_such_tool", {}),
     ],

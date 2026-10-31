@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import cli, config, tools
+from src import cli, config, presentation, tools
 from src.agent import Agent, AgentError, Answer, MAX_TOOL_ROUNDS, ToolCall, find_unverified_numbers
 
 pytestmark = pytest.mark.skipif(
@@ -65,6 +65,72 @@ def test_command_line_evidence_shows_score_disclaimer_and_small_base_warning():
     text = cli.render_evidence(answer)
     assert "Preliminary screening proxy" in text
     assert "WARNING: ILG: Small base year: 2022 had 4,988 passengers" in text
+
+
+SAMPLE_ANSWER = """ILG, DRO and SAF rank highest on the score among all eligible airports.
+
+These are airports worth further investigation, not confirmed terminal needs. ILG's score reflects very fast growth \
+from almost no traffic, while DRO and SAF combine strong percentage growth with high load factors. Larger airports \
+add far more passengers, so absolute growth and CAGR tell different stories.
+
+Warning: ILG has a small base, and terminal capacity is not directly measured."""
+
+
+def narrative_words(text):
+    return len(" ".join(line for line in text.splitlines() if not line.lstrip().startswith("|")).split())
+
+
+def test_concise_sample_stays_within_the_word_target_and_keeps_tables_out_of_the_narrative():
+    assert narrative_words(SAMPLE_ANSWER) <= 180
+    conclusion, rest = presentation.split_answer(SAMPLE_ANSWER)
+    assert conclusion.endswith("eligible airports.")
+    assert rest.startswith("These are airports")
+    assert rest.count("Warning:") == 1
+
+
+def test_command_line_answer_places_the_python_table_after_the_conclusion():
+    result = tools.rank_opportunity_score([], 3)
+    answer = Answer(SAMPLE_ANSWER, [ToolCall("rank_opportunity_score", {"states": [], "top_n": 3}, result, False)])
+    text = cli.render_answer(answer)
+    assert text.index("eligible airports.") < text.index("#1 of 229") < text.index("These are airports")
+    assert "78.38" in text
+    assert "WARNING: Small base year" not in text
+
+
+def test_command_line_answer_shows_a_notice_when_the_warning_is_missing():
+    result = tools.rank_opportunity_score(["DE"], 1)
+    answer = Answer("ILG leads.", [ToolCall("rank_opportunity_score", {"states": ["DE"], "top_n": 1}, result, False)])
+    assert "WARNING: Small base year: ILG (" in cli.render_answer(answer)
+
+
+def test_model_written_table_is_removed_from_the_narrative():
+    conclusion, rest = presentation.split_answer("Top.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nInsight.")
+    assert (conclusion, rest) == ("Top.", "Insight.")
+
+
+def test_absolute_ranking_lists_the_ranked_measure_first():
+    result = tools.rank_airports(3, [], 2, 100_000, "absolute_passenger_growth")
+    table = presentation.main_tables([ToolCall("rank_airports", {}, result, False)])[0].data
+    columns = list(table.columns)
+    assert columns.index("Absolute Passenger Growth 3Y") < columns.index("Passenger CAGR 3Y (%)")
+    assert table.iloc[0]["National rank"].startswith("#1 of ")
+
+
+def test_cagr_ranking_lists_the_ranked_measure_first():
+    result = tools.rank_airports(3, [], 2, 100_000)
+    columns = list(presentation.main_tables([ToolCall("rank_airports", {}, result, False)])[0].data.columns)
+    assert columns.index("Passenger CAGR 3Y (%)") < columns.index("Absolute Passenger Growth 3Y")
+
+
+def test_tool_error_produces_no_results_table():
+    assert presentation.main_tables([ToolCall("rank_airports", {}, {"error": "Bad"}, True)]) == []
+
+
+def test_agent_code_does_not_route_by_question_words():
+    source = (config.ROOT / "src" / "agent.py").read_text() + (config.ROOT / "src" / "gemini_agent.py").read_text()
+    assert "question.lower" not in source
+    assert " in question" not in source
+    assert "tool_choice" not in source
 
 
 def test_invented_number_is_flagged():

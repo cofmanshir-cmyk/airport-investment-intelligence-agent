@@ -11,6 +11,8 @@ from . import analytics, config, scoring
 
 MAX_TOP_N = 25
 MAX_COMPARE = 6
+PASSENGER_COMPARISONS = ("at_least", "over")
+TABLE_SECTIONS = ("score", "demand", "congestion", "cargo")
 
 SOURCES = {
     "t100_summary": "BTS T-100 Segment Summary By Origin Airport (r495-tyji), all carriers",
@@ -173,6 +175,39 @@ def _selected_states(states: list[str], airports: pd.DataFrame) -> set[str]:
     return selected
 
 
+def _check_passenger_filter(minimum: int, comparison: str) -> None:
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+        raise ToolInputError("min_passengers_2025 must be a non-negative whole number.")
+    if comparison not in PASSENGER_COMPARISONS:
+        raise ToolInputError(f"passenger_comparison must be one of {PASSENGER_COMPARISONS}.")
+
+
+def _passenger_filter_active(minimum: int, comparison: str) -> bool:
+    return minimum > 0 or comparison == "over"
+
+
+def _passenger_filter_label(minimum: int, comparison: str) -> str:
+    if not _passenger_filter_active(minimum, comparison):
+        return "All eligible airports"
+    return f"{'Over' if comparison == 'over' else 'At least'} {minimum:,} 2025 departing passengers"
+
+
+def _passes_passenger_filter(airport: str, minimum: int, comparison: str) -> bool:
+    """Decide whether an airport is shown. This never changes a score or rank."""
+    if not _passenger_filter_active(minimum, comparison):
+        return True
+    passengers = analytics.year_inputs(_annual(), airport)[str(analytics.END_YEAR)].get("passengers")
+    if passengers is None:
+        return False
+    return passengers > minimum if comparison == "over" else passengers >= minimum
+
+
+def _check_table_sections(sections: list[str] | None) -> None:
+    unknown = sorted(set(sections or []) - set(TABLE_SECTIONS))
+    if unknown:
+        raise ToolInputError(f"Unknown table_sections: {unknown}. Use any of {list(TABLE_SECTIONS)}.")
+
+
 def _resolve(code: str) -> str:
     """Accept a T-100 or FAA airport code and return the T-100 code."""
     cleaned = str(code).strip().upper()
@@ -239,11 +274,13 @@ PROFILE_DEFINITIONS = {
 }
 
 
-def get_airport_profile(airport: str) -> dict:
+def get_airport_profile(airport: str, table_sections: list[str] | None = None) -> dict:
     code = _resolve(airport)
+    _check_table_sections(table_sections)
     return {
         "periods": {"demand": "Calendar years 2015, 2022, 2025", "congestion": "Calendar 2025"},
         "disclaimer": SCORE_DISCLAIMER,
+        "table_sections": table_sections,
         "profile": _profile(code),
         "peer_group": PEER_GROUP,
         "definitions": PROFILE_DEFINITIONS,
@@ -252,9 +289,10 @@ def get_airport_profile(airport: str) -> dict:
     }
 
 
-def compare_airports(airports: list[str]) -> dict:
+def compare_airports(airports: list[str], table_sections: list[str] | None = None) -> dict:
     if not 2 <= len(airports) <= MAX_COMPARE:
         raise ToolInputError(f"Provide between 2 and {MAX_COMPARE} airport codes.")
+    _check_table_sections(table_sections)
     codes = [_resolve(code) for code in airports]
     if len(set(codes)) != len(codes):
         raise ToolInputError("Airport codes must be different.")
@@ -290,6 +328,7 @@ def compare_airports(airports: list[str]) -> dict:
     return {
         "periods": {"demand": "Calendar years 2015, 2022, 2025", "congestion": "Calendar 2025"},
         "disclaimer": SCORE_DISCLAIMER,
+        "table_sections": table_sections,
         "airports": profiles,
         "differences_from_first_airport": {
             "opportunity_score": score_differences(),
@@ -306,26 +345,36 @@ def compare_airports(airports: list[str]) -> dict:
     }
 
 
-def rank_opportunity_score(states: list[str], top_n: int) -> dict:
-    """Show scores in national rank order. A state filter only hides rows."""
+def rank_opportunity_score(
+    states: list[str], top_n: int, min_passengers_2025: int = 0, passenger_comparison: str = "at_least"
+) -> dict:
+    """Show scores in national rank order. Filters only hide rows, so scores and ranks never change."""
     if not 1 <= top_n <= MAX_TOP_N:
         raise ToolInputError(f"top_n must be between 1 and {MAX_TOP_N}.")
+    _check_passenger_filter(min_passengers_2025, passenger_comparison)
     selected = _selected_states(states, _airports())
-    keep = lambda record: not selected or record["state"] in selected
+    keep = lambda record: (not selected or record["state"] in selected) and _passes_passenger_filter(
+        record["airport"], min_passengers_2025, passenger_comparison
+    )
+    filtered = bool(selected) or _passenger_filter_active(min_passengers_2025, passenger_comparison)
     scores = _scores()
     matching = [record for record in scores["scored"] if keep(record)]
     ranked = [
         {
             **{key: value for key, value in record.items() if key != "components"},
+            **({"position_in_this_list": position} if filtered else {}),
             "score_points": {metric: part["points"] for metric, part in record["components"].items()},
         }
-        for record in matching[:top_n]
+        for position, record in enumerate(matching[:top_n], start=1)
     ]
     return {
-        "metric": "Airport Opportunity Score",
+        "metric": "Airport Opportunity Score, in points out of 100",
         "disclaimer": SCORE_DISCLAIMER,
         "periods": "Full calendar years 2015, 2022 and 2025",
-        "filters": {"states": sorted(selected) or "all"},
+        "filters": {
+            "states": sorted(selected) or "all",
+            "passengers_2025": _passenger_filter_label(min_passengers_2025, passenger_comparison),
+        },
         "peer_group": PEER_GROUP,
         "airports_eligible": scores["airports_eligible"],
         "airports_scored_nationally": scores["airports_scored"],
@@ -345,7 +394,13 @@ def rank_opportunity_score(states: list[str], top_n: int) -> dict:
 
 
 def rank_airports(
-    window_years: int, states: list[str], top_n: int, min_enplanements: int, rank_by: str = "passenger_cagr"
+    window_years: int,
+    states: list[str],
+    top_n: int,
+    min_enplanements: int,
+    rank_by: str = "passenger_cagr",
+    min_passengers_2025: int = 0,
+    passenger_comparison: str = "at_least",
 ) -> dict:
     if not 1 <= top_n <= MAX_TOP_N:
         raise ToolInputError(f"top_n must be between 1 and {MAX_TOP_N}.")
@@ -355,15 +410,22 @@ def rank_airports(
         raise ToolInputError("min_enplanements must be 50000, 100000 or 250000.")
     if rank_by not in analytics.RANK_METRICS:
         raise ToolInputError(f"rank_by must be one of {sorted(analytics.RANK_METRICS)}.")
+    _check_passenger_filter(min_passengers_2025, passenger_comparison)
 
     airports = _airports()
-    _selected_states(states, airports)
+    selected = _selected_states(states, airports)
 
     result = analytics.rank_passenger_growth(
         _annual(), airports, _mix(), window_years, min_enplanements, states, rank_by
     )
-    matching = len(result["ranked"])
-    result["ranked"] = result["ranked"][:top_n]
+    keep = lambda record: _passes_passenger_filter(record["airport"], min_passengers_2025, passenger_comparison)
+    listed = [record for record in result["ranked"] if keep(record)]
+    result["not_ranked"] = [record for record in result["not_ranked"] if keep(record)]
+    matching = len(listed)
+    if selected or _passenger_filter_active(min_passengers_2025, passenger_comparison):
+        for position, record in enumerate(listed, start=1):
+            record["position_in_this_list"] = position
+    result["ranked"] = listed[:top_n]
     absolute = rank_by == "absolute_passenger_growth"
     name = "Absolute Passenger Growth" if absolute else "Passenger CAGR"
     role = (
@@ -377,6 +439,7 @@ def rank_airports(
         "filters": {
             "min_faa_enplanements_2025": min_enplanements,
             "states": [state.upper() for state in states] or "all",
+            "passengers_2025": _passenger_filter_label(min_passengers_2025, passenger_comparison),
         },
         "airports_matching_filters": matching,
         **result,
@@ -436,20 +499,41 @@ def _schema(properties: dict) -> dict:
 
 
 AIRPORT_CODE = {"type": "string", "description": "3-letter airport code, for example SFO"}
+MIN_PASSENGERS = {
+    "type": "integer",
+    "description": (
+        "Show only airports above this many 2025 departing passengers. Any non-negative whole number. Use 0 unless "
+        "the user asks for a size limit. This changes which airports are shown, never a score or national rank"
+    ),
+}
+PASSENGER_COMPARISON = {
+    "type": "string",
+    "enum": list(PASSENGER_COMPARISONS),
+    "description": "over when the user says over or more than; otherwise at_least",
+}
+SECTIONS = {
+    "type": "array",
+    "items": {"type": "string", "enum": list(TABLE_SECTIONS)},
+    "description": (
+        "Sections to show in the results table beneath the answer. Choose only those that answer the question, "
+        "or none when a sentence answers it. All data remains in the evidence section either way"
+    ),
+}
 
 TOOL_DEFINITIONS = [
     {
         "name": "rank_opportunity_score",
         "description": (
-            "Rank US airports by the Airport Opportunity Score, a preliminary screening proxy built from 11 weighted "
-            "metrics. Use when the user asks about the score or a score ranking. Scores use a fixed national peer "
-            "group, so a state filter only limits which airports are shown. Pass a list of states for a region; "
-            "New England is CT, MA, ME, NH, RI, VT."
+            "Rank US airports by the Airport Opportunity Score, a broad screening proxy from 11 weighted metrics, in "
+            "points out of 100. Scores use a fixed national peer group, so state and passenger filters only limit which "
+            "airports are shown. Pass a list of states for a region; New England is CT, MA, ME, NH, RI, VT."
         ),
         "strict": True,
         "input_schema": _schema({
             "states": {"type": "array", "items": {"type": "string"}, "description": "2-letter state codes; empty for all"},
             "top_n": {"type": "integer", "description": f"Airports to return, 1 to {MAX_TOP_N}"},
+            "min_passengers_2025": MIN_PASSENGERS,
+            "passenger_comparison": PASSENGER_COMPARISON,
         }),
     },
     {
@@ -475,6 +559,8 @@ TOOL_DEFINITIONS = [
                     "Use passenger_cagr unless the user asks for the number of passengers added"
                 ),
             },
+            "min_passengers_2025": MIN_PASSENGERS,
+            "passenger_comparison": PASSENGER_COMPARISON,
         }),
     },
     {
@@ -486,6 +572,7 @@ TOOL_DEFINITIONS = [
         "strict": True,
         "input_schema": _schema({
             "airports": {"type": "array", "items": AIRPORT_CODE, "description": "Airport codes; the first is the reference"},
+            "table_sections": SECTIONS,
         }),
     },
     {
@@ -495,7 +582,7 @@ TOOL_DEFINITIONS = [
             "cargo context and warnings. Use for questions about one airport."
         ),
         "strict": True,
-        "input_schema": _schema({"airport": AIRPORT_CODE}),
+        "input_schema": _schema({"airport": AIRPORT_CODE, "table_sections": SECTIONS}),
     },
     {
         "name": "get_long_haul_share",

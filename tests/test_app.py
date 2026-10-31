@@ -22,6 +22,7 @@ pytestmark = pytest.mark.skipif(
 
 FAKE_KEY = "fake-key-for-tests-123456"
 APP_PATH = str(config.ROOT / "app.py")
+SCORE_LABEL = presentation.SCORE_LABEL
 
 
 def function_call(name, args):
@@ -50,6 +51,19 @@ class FakeNetwork:
             ]})
         self.generate_calls += 1
         return httpx.Response(self.status, json=self.replies.pop(0))
+
+
+class RecordingNetwork(FakeNetwork):
+    """Also keep each request body, to check what the model receives."""
+
+    def __init__(self, *replies):
+        super().__init__(*replies)
+        self.bodies = []
+
+    def __call__(self, request):
+        if request.method != "GET":
+            self.bodies.append(json.loads(request.content))
+        return super().__call__(request)
 
 
 @pytest.fixture
@@ -81,7 +95,7 @@ def button(app, label):
 def connect(app, model=None):
     app.text_input[0].set_value(FAKE_KEY)
     if model:
-        app.selectbox[0].set_value(model)
+        next(item for item in app.selectbox if item.label == "Model").set_value(model)
     button(app, "Connect").click().run()
     assert not app.exception
     return app
@@ -106,11 +120,13 @@ def evidence_expanders(app):
 def test_page_loads_with_score_disclaimer_and_makes_no_network_call(run_app):
     network = FakeNetwork()
     app = run_app(network)
-    banner = app.info[0].value
-    assert "Airport Opportunity Score: Preliminary screening proxy" in banner
-    assert "35% of the score uses cargo-inclusive departure metrics" in banner
-    assert "favors larger airports" in banner
-    assert "2022 base year was still in recovery" in banner
+    assert "preliminary screening proxy" in app.info[0].value
+    assert len(app.info[0].value.split()) < 20
+    details = page_text(app)
+    assert "35% of the score uses cargo-inclusive departure metrics" in details
+    assert "favors larger airports" in details
+    assert "2022 base year was still in recovery" in details
+    assert "points out of 100, not probabilities" in details
     assert network.keys_seen == []
 
 
@@ -192,8 +208,8 @@ def test_comparison_shows_answer_and_python_evidence(run_app):
     assert network.generate_calls == 2
     assert "SNA had 19.2%" in page_text(app)
     evidence = evidence_expanders(app)
-    assert evidence[0].label.startswith("Evidence, sources and caveats")
-    assert evidence[0].proto.expanded
+    assert evidence[0].label.startswith("Evidence, methodology, sources and caveats")
+    assert not evidence[0].proto.expanded
     assert [tab.label for tab in app.tabs[:5]] == ["Results", "Definitions", "Sources", "Caveats", "Raw"]
     assert not app.warning or "do not match" not in page_text(app)
     congestion = next(frame.value for frame in app.dataframe if "Average taxi-out (min)" in set(frame.value["Measure"]))
@@ -231,10 +247,12 @@ def test_score_ranking_shows_context_warnings_and_disclaimers(run_app):
         text_reply("ILG scored 78.38."),
     )
     app = ask(connect(run_app(network)), "Highest scores?")
-    table = next(frame.value for frame in app.dataframe if "Airport Opportunity Score" in frame.value.columns)
+    table = next(frame.value for frame in app.dataframe if SCORE_LABEL in frame.value.columns)
     first = table.iloc[0]
     assert first["Airport"] == "ILG"
-    assert first["Airport Opportunity Score"] == 78.38
+    assert first[SCORE_LABEL] == 78.38
+    assert first["National rank"] == "#1 of 229"
+    assert presentation.POSITION_LABEL not in table.columns
     assert first["Passengers 2022"] == 4988
     assert first["Passengers 2025"] == first["Passengers 2022"] + first["Absolute Passenger Growth 3Y"]
     assert first["Passenger CAGR 3Y (%)"] == 223.74
@@ -247,38 +265,129 @@ def test_score_ranking_shows_context_warnings_and_disclaimers(run_app):
     assert any("Absolute Passenger Growth 3Y (passengers)" in set(frame.value.get("Measure", [])) for frame in app.dataframe)
 
 
-def test_small_base_warning_is_shown_outside_the_collapsed_evidence(run_app):
+def test_small_base_notice_appears_when_the_model_omits_it(run_app):
     network = FakeNetwork(
-        function_call("get_airport_profile", {"airport": "ILG"}), text_reply("First."),
-        function_call("get_airport_profile", {"airport": "SFO"}), text_reply("Second."),
+        function_call("get_airport_profile", {"airport": "ILG"}), text_reply("ILG grew quickly."),
     )
-    app = ask(ask(connect(run_app(network)), "ILG?"), "SFO?")
-    assert any(item.value.startswith("ILG: Small base year") for item in app.warning)
+    app = ask(connect(run_app(network)), "ILG?")
+    notices = [item.value for item in app.warning if item.value.startswith("Small base year: ILG (")]
+    assert len(notices) == 1
+    assert "2022: 4,988" in notices[0]
 
 
-def test_filtered_score_ranking_keeps_the_national_rank(run_app):
+def test_small_base_notice_is_not_repeated_when_the_model_states_it(run_app):
     network = FakeNetwork(
-        function_call("rank_opportunity_score", {"states": ["DE"], "top_n": 5}),
-        text_reply("ILG scored 78.38."),
+        function_call("get_airport_profile", {"airport": "ILG"}),
+        text_reply("ILG grew quickly.\n\nWarning: ILG has a small base in 2015 and 2022."),
     )
-    app = ask(connect(run_app(network)), "Delaware score?")
-    table = next(frame.value for frame in app.dataframe if "Airport Opportunity Score" in frame.value.columns)
-    assert table.iloc[0]["National rank"] == 1
-    assert table.iloc[0]["Airport Opportunity Score"] == 78.38
+    app = ask(connect(run_app(network)), "ILG?")
+    assert not [item.value for item in app.warning if item.value.startswith("Small base year: ILG (")]
 
 
-def test_profile_shows_the_score_table_with_passenger_context(run_app):
-    network = FakeNetwork(function_call("get_airport_profile", {"airport": "ATL"}), text_reply("ATL scored 50.66."))
+def test_naming_an_airport_without_the_warning_still_shows_the_notice(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "ILG"}),
+        text_reply("ILG grew quickly.\n\nWarning: terminal capacity is not directly measured."),
+    )
+    app = ask(connect(run_app(network)), "ILG?")
+    assert [item.value for item in app.warning if item.value.startswith("Small base year: ILG (")]
+
+
+def test_filtered_score_ranking_keeps_the_national_rank_and_labels_the_position(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": ["CA"], "top_n": 5, "min_passengers_2025": 2000000, "passenger_comparison": "over"}),
+        text_reply("SFO leads."),
+    )
+    app = ask(connect(run_app(network)), "California airports over 2 million?")
+    table = next(frame.value for frame in app.dataframe if SCORE_LABEL in frame.value.columns)
+    assert table.iloc[0]["Airport"] == "SFO"
+    assert table.iloc[0]["National rank"] == "#17 of 229"
+    assert table.iloc[0][SCORE_LABEL] == 62.39
+    assert table.iloc[0][presentation.POSITION_LABEL] == 1
+    text = page_text(app)
+    assert "Over 2,000,000 2025 departing passengers" in text
+    assert "Filters do not change scores or national ranks" in text
+
+
+def test_passenger_preset_is_passed_to_the_model_and_the_question_stays_clean(run_app):
+    network = RecordingNetwork(text_reply("Answer."))
+    app = connect(run_app(network))
+    next(item for item in app.selectbox if "Minimum 2025 departing passengers" in item.label).set_value("At least 1 million")
+    ask(app, "Top airports?")
+    sent = json.dumps(network.bodies[0]["contents"])
+    assert "at least 1,000,000 2025 departing passengers" in sent
+    assert app.session_state["history"][0][0] == "Top airports?"
+
+
+def test_default_preset_adds_no_filter_to_the_question(run_app):
+    network = RecordingNetwork(text_reply("Answer."))
+    ask(connect(run_app(network)), "Which airports should we investigate for terminal expansion?")
+    assert "Selected filter" not in json.dumps(network.bodies[0]["contents"])
+
+
+def test_presets_offer_the_agreed_options(run_app):
+    box = next(item for item in run_app(FakeNetwork()).selectbox if "Minimum 2025 departing passengers" in item.label)
+    assert box.options == ["All eligible airports", "At least 500,000", "At least 1 million", "At least 5 million", "At least 10 million"]
+    assert box.value == "All eligible airports"
+
+
+def test_answer_separates_conclusion_and_insights_around_the_python_table(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}),
+        text_reply("ILG scores highest.\n\n| Airport | Score |\n|---|---|\n| ILG | 99 |\n\nInsight one.\n\nWarning: ILG has a small base."),
+    )
+    app = ask(connect(run_app(network)), "Top scores?")
+    values = [item.value for item in app.markdown]
+    assert "ILG scores highest." in values
+    insight = next(value for value in values if value.startswith("Insight one."))
+    assert "99" not in insight and "| Airport" not in " ".join(values)
+    assert next(frame.value for frame in app.dataframe if SCORE_LABEL in frame.value.columns).iloc[0][SCORE_LABEL] == 78.38
+
+
+def test_factual_question_gets_no_forced_table_or_score(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}),
+        text_reply("SFO's Total Load Factor in 2025 was 82.26%."),
+    )
+    app = ask(connect(run_app(network)), "What is SFO's load factor?")
+    tree_text = page_text(app)
+    assert tree_text.count("SFO's Total Load Factor") == 1
+    assert not [item.value for item in app.warning if "Warning" in item.value]
+    assert presentation.main_tables(app.session_state["history"][0][1].tool_calls) == []
+
+
+def test_comparison_table_shows_only_the_chosen_sections(run_app):
+    network = FakeNetwork(
+        function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["congestion"]}),
+        text_reply("SNA had more delays."),
+    )
+    app = ask(connect(run_app(network)), "Compare LAX and SNA congestion")
+    tables = presentation.main_tables(app.session_state["history"][0][1].tool_calls)
+    assert [table.title for table in tables] == ["Operational congestion"]
+
+
+def test_material_warning_stays_available_in_evidence_when_collapsed(run_app):
+    network = FakeNetwork(function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("ILG leads."))
+    app = ask(connect(run_app(network)), "Top?")
+    warnings = " ".join(item.value for item in app.warning)
+    assert "35% of the score uses cargo-inclusive departure metrics" in warnings
+    assert "terminal capacity" in warnings
+
+
+def test_profile_table_shows_score_and_rank_when_chosen(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "ATL", "table_sections": ["score"]}),
+        text_reply("ATL scored 50.66."),
+    )
     app = ask(connect(run_app(network)), "ATL?")
     table = next(
         frame.value for frame in app.dataframe
-        if "Airport Opportunity Score" in set(frame.value.get("Measure", []))
+        if SCORE_LABEL in set(frame.value.get("Measure", []))
     ).set_index("Measure")["ATL"]
-    assert table["Airport Opportunity Score"] == 50.66
-    assert table["National rank"] == 82
-    assert table["Absolute Passenger Growth 3Y"] == 5924745
-    assert table["Passenger CAGR 3Y (%)"] == 4.16
-    assert table["Passengers 2025"] - table["Passengers 2022"] == 5924745
+    assert table[SCORE_LABEL] == "50.66"
+    assert table["National rank"] == "#82 of 229"
+    assert table["Absolute Passenger Growth 3Y"] == "5,924,745"
+    assert table["Passenger CAGR 3Y (%)"] == "4.16"
 
 
 def test_airport_without_a_score_says_why(run_app):
@@ -312,7 +421,7 @@ def test_newest_answer_appears_first_and_only_it_is_expanded(run_app):
     app = ask(ask(connect(run_app(network)), "First"), "Second")
     text = page_text(app)
     assert text.index("Second answer.") < text.index("First answer.")
-    assert [item.proto.expanded for item in evidence_expanders(app)] == [True, False]
+    assert [item.proto.expanded for item in evidence_expanders(app)] == [False, False]
 
 
 def test_invented_number_warning_is_shown(run_app):
