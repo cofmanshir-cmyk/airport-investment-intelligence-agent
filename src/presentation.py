@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
@@ -58,6 +58,8 @@ RANK_COLUMNS = {
 }
 
 SCORE_LABEL = "Score (points out of 100)"
+SCORE_TABLE_TITLE = "Airport Opportunity Score"
+SCORE_PROXY_NOTE = "Preliminary screening proxy, not an investment recommendation."
 POSITION_LABEL = "Position in this list"
 
 SCORE_COLUMNS = {
@@ -96,7 +98,6 @@ class ToolEvidence:
     label: str
     inputs: dict
     error: str | None = None
-    disclaimer: str | None = None
     periods: list[str] = field(default_factory=list)
     tables: list[Table] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -142,9 +143,9 @@ def _score_tables(profiles: dict[str, dict]) -> list[Table]:
     sections = {code: profile["opportunity_score"] for code, profile in profiles.items()}
     reasons = [f"{code} has no score: {section['reason']}." for code, section in sections.items() if "reason" in section]
     tables = [_section_table(
-        "Airport Opportunity Score",
+        SCORE_TABLE_TITLE,
         {code: _score_summary(section) for code, section in sections.items()},
-        " ".join(["Preliminary screening proxy, not an investment recommendation.", *reasons]),
+        " ".join([SCORE_PROXY_NOTE, *reasons]),
     )]
     points = {
         code: {metric: part["points"] for metric, part in section["components"].items()}
@@ -273,7 +274,7 @@ def _opportunity_evidence(result: dict) -> tuple[list[Table], list[str]]:
             if key != "position_in_this_list" or "position_in_this_list" in rows[0]
         }
         tables.append(Table(
-            "Airport Opportunity Score",
+            SCORE_TABLE_TITLE,
             pd.DataFrame(rows).reindex(columns=list(columns)).rename(columns=columns),
             _filter_note(result["filters"]),
         ))
@@ -342,6 +343,59 @@ def main_tables(calls: list[ToolCall]) -> list[Table]:
     return tables
 
 
+def _returned_scores(calls: list[ToolCall]) -> list[tuple[float, int, int]]:
+    """List each returned score as (score, national rank, airports scored nationally)."""
+    scores = []
+    for call in calls:
+        if call.is_error:
+            continue
+        result = call.result
+        if call.name == "rank_opportunity_score":
+            total = result["airports_scored_nationally"]
+            scores += [(row["opportunity_score"], row["national_rank"], total) for row in result["ranked"]]
+        elif call.name in ("compare_airports", "get_airport_profile"):
+            profiles = result["airports"].values() if call.name == "compare_airports" else [result["profile"]]
+            sections = [profile["opportunity_score"] for profile in profiles]
+            scores += [
+                (section["opportunity_score"], section["national_rank"], section["national_peer_count"])
+                for section in sections
+                if section["opportunity_score"] is not None
+            ]
+    return scores
+
+
+def _states_returned_score(score: float, rank: int, total: int, narrative: str) -> bool:
+    """Match an exact returned score, never a percentage, or a rank out of the scored total."""
+    return bool(
+        re.search(rf"(?<![\d.,]){re.escape(str(score))}0*(?!\d|\s?%)", narrative)
+        or re.search(rf"(?<![\d.,])#?{rank} of {total}\b", narrative)
+    )
+
+
+def reports_opportunity_score(
+    calls: list[ToolCall], narrative: str, earlier_calls: list[ToolCall] | None = None
+) -> bool:
+    """Decide from tool results and displayed values whether this answer reports the score.
+
+    The profile and comparison tools always return score data, so returning it is not
+    enough. Earlier results count because a follow-up can restate a score without a new tool.
+    """
+    succeeded = [call for call in calls if not call.is_error]
+    if any(call.name == "rank_opportunity_score" for call in succeeded):
+        return True
+    if any(table.title == SCORE_TABLE_TITLE for table in main_tables(succeeded)):
+        return True
+    return any(
+        _states_returned_score(score, rank, total, narrative)
+        for score, rank, total in _returned_scores([*(earlier_calls or []), *succeeded])
+    )
+
+
+def without_score_proxy_note(tables: list[Table]) -> list[Table]:
+    """Remove the caption that would repeat the answer's own score disclaimer."""
+    return [replace(table, note=table.note.removeprefix(SCORE_PROXY_NOTE).strip()) for table in tables]
+
+
 def small_base_notice(calls: list[ToolCall], narrative: str) -> str | None:
     """Return one short warning for small-base airports the narrative does not warn about."""
     paragraphs = re.split(r"\n\s*\n", narrative)
@@ -404,7 +458,6 @@ def build_evidence(call: ToolCall) -> ToolEvidence:
         return evidence
 
     result = call.result
-    evidence.disclaimer = result.get("disclaimer")
     if call.name == "rank_opportunity_score":
         evidence.periods = [result["periods"]]
         evidence.tables, evidence.warnings = _opportunity_evidence(result)

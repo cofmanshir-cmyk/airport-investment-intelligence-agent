@@ -117,21 +117,59 @@ def evidence_expanders(app):
     return [item for item in app.expander if item.label.startswith("Evidence")]
 
 
-def test_page_loads_with_score_disclaimer_and_makes_no_network_call(run_app):
+def score_expanders(block):
+    return [item for item in block.expander if item.label == "How the Airport Opportunity Score works"]
+
+
+def assert_no_score_ui(app):
+    assert not app.info
+    assert not score_expanders(app)
+    assert tools.SCORE_DISCLAIMER not in page_text(app)
+
+
+def assert_score_ui_once(app, answers=1):
+    assert len(app.info) == answers
+    assert all("preliminary screening proxy" in item.value for item in app.info)
+    assert len(score_expanders(app)) == answers
+    assert not any(item.proto.expanded for item in score_expanders(app))
+    assert not [item.value for item in app.warning if item.value.startswith("Preliminary screening proxy")]
+    assert presentation.SCORE_PROXY_NOTE not in page_text(app)
+
+
+def test_page_loads_without_score_ui_and_makes_no_network_call(run_app):
     network = FakeNetwork()
     app = run_app(network)
-    assert "preliminary screening proxy" in app.info[0].value
-    assert len(app.info[0].value.split()) < 20
+    assert_no_score_ui(app)
+    assert not list(app.expander)
+    assert not list(app.dataframe)
+    assert network.keys_seen == []
+
+
+def test_score_answer_explains_the_score_beneath_the_answer(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}),
+        text_reply("ILG scores highest.\n\nInsight one.\n\nWarning: ILG has a small base."),
+    )
+    app = ask(connect(run_app(network)), "Top scores?")
+    assert_score_ui_once(app)
+    assistant = app.chat_message[1]
+    assert len(assistant.info) == 1 and len(score_expanders(assistant)) == 1
+    children = list(assistant.children.values())
+    position = lambda wanted: next(index for index, child in enumerate(children) if child is wanted)
+    insight = next(child for child in assistant.markdown if child.value.startswith("Insight one."))
+    assert position(insight) < position(assistant.info[0]) < position(score_expanders(assistant)[0])
+    assert position(score_expanders(assistant)[0]) == len(children) - 1
     details = page_text(app)
     assert "35% of the score uses cargo-inclusive departure metrics" in details
     assert "favors larger airports" in details
     assert "2022 base year was still in recovery" in details
     assert "points out of 100, not probabilities" in details
-    assert network.keys_seen == []
+    assert evidence_expanders(app)
 
 
 def test_methodology_lists_all_11_weights(run_app):
-    app = run_app(FakeNetwork())
+    network = FakeNetwork(function_call("rank_opportunity_score", {"states": [], "top_n": 1}), text_reply("ILG leads."))
+    app = ask(connect(run_app(network)), "Top score?")
     table = next(frame.value for frame in app.dataframe if "Weight (%)" in frame.value.columns)
     assert len(table) == 11
     assert table["Weight (%)"].sum() == 100
@@ -261,7 +299,7 @@ def test_score_ranking_shows_context_warnings_and_disclaimers(run_app):
     warnings = " ".join(item.value for item in app.warning)
     assert "ILG: Small base year: 2022 had 4,988 passengers" in warnings
     assert "PAE: Small base year: 2015 had 92 passengers" in warnings
-    assert "Preliminary screening proxy" in warnings
+    assert "Preliminary screening proxy" in page_text(app)
     assert any("Absolute Passenger Growth 3Y (passengers)" in set(frame.value.get("Measure", [])) for frame in app.dataframe)
 
 
@@ -369,9 +407,9 @@ def test_comparison_table_shows_only_the_chosen_sections(run_app):
 def test_material_warning_stays_available_in_evidence_when_collapsed(run_app):
     network = FakeNetwork(function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("ILG leads."))
     app = ask(connect(run_app(network)), "Top?")
-    warnings = " ".join(item.value for item in app.warning)
-    assert "35% of the score uses cargo-inclusive departure metrics" in warnings
-    assert "terminal capacity" in warnings
+    text = page_text(app)
+    assert "35% of the score uses cargo-inclusive departure metrics" in text
+    assert "terminal capacity" in text
 
 
 def test_profile_table_shows_score_and_rank_when_chosen(run_app):
@@ -422,6 +460,160 @@ def test_newest_answer_appears_first_and_only_it_is_expanded(run_app):
     text = page_text(app)
     assert text.index("Second answer.") < text.index("First answer.")
     assert [item.proto.expanded for item in evidence_expanders(app)] == [False, False]
+
+
+RANK_CAGR = {"window_years": 3, "states": [], "top_n": 3, "min_enplanements": 100000}
+ATL_PROFILE = {"airport": "ATL", "table_sections": []}
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        [function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("ILG leads.")],
+        [function_call("rank_opportunity_score", {"states": ["ZZ"], "top_n": 3}),
+         function_call("rank_opportunity_score", {"states": ["CA"], "top_n": 3}), text_reply("SFO leads.")],
+        [function_call("get_airport_profile", {"airport": "ATL", "table_sections": ["score"]}), text_reply("See the table.")],
+        [function_call("get_airport_profile", ATL_PROFILE), text_reply("ATL scored 50.66.")],
+        [function_call("get_airport_profile", ATL_PROFILE), text_reply("ATL reached 50.66 points.")],
+        [function_call("get_airport_profile", ATL_PROFILE), text_reply("ATL is #82 of 229 nationally.")],
+        [function_call("get_airport_profile", {"airport": "JAC", "table_sections": ["score"]}), text_reply("See the table.")],
+        [function_call("compare_airports", {"airports": ["LAX", "SNA"]}), text_reply("Compared.")],
+        [function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["score", "congestion"]}), text_reply("Compared.")],
+        [function_call("rank_opportunity_score", {"states": [], "top_n": 3}),
+         function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["score"]}), text_reply("Both.")],
+    ],
+    ids=[
+        "score_ranking", "score_tool_rejected_then_used", "profile_score_table", "profile_narrative_word",
+        "profile_narrative_value", "profile_narrative_rank", "unscored_airport_table", "comparison_default_table",
+        "comparison_score_section", "two_scoring_tools",
+    ],
+)
+def test_answers_reporting_the_score_show_its_ui_once(run_app, replies):
+    # The question never mentions the score, so only the tools and the answer can trigger this.
+    app = ask(connect(run_app(FakeNetwork(*replies))), "Tell me about these airports")
+    assert_score_ui_once(app)
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        [function_call("rank_airports", RANK_CAGR), text_reply("These are raw values, not the Airport Opportunity Score.")],
+        [function_call("get_long_haul_share", {"airport": "ANC", "threshold_miles": 3000}), text_reply("ANC is 2.6% long-haul.")],
+        [function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}), text_reply("SFO grew 8.87% a year.")],
+        [function_call("get_airport_profile", {"airport": "SFO", "table_sections": ["demand"]}), text_reply("SFO grew 8.87% a year.")],
+        [function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["congestion"]}), text_reply("SNA had more delays.")],
+        [text_reply("Hello.")],
+        [function_call("rank_opportunity_score", {"states": ["ZZ"], "top_n": 3}), text_reply("That state code was rejected.")],
+        [function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}), text_reply("SFO's CAGR is one input to the score.")],
+        [function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}), text_reply("Warning: 35% of the score uses cargo-inclusive metrics.")],
+        [function_call("get_airport_profile", {"airport": "ATL", "table_sections": []}), text_reply("Some share was 50.66% and ATL ranks #82 by size.")],
+        [function_call("get_airport_profile", {"airport": "JAC", "table_sections": []}), text_reply("JAC has no score.")],
+        [text_reply("I can explain the Opportunity Score.")],
+    ],
+    ids=[
+        "cagr_ranking", "long_haul", "profile_fact", "profile_demand_table", "congestion", "no_tool", "rejected_score_tool",
+        "incidental_score_word", "score_word_in_warning", "same_digits_as_percentage_and_bare_rank", "no_score_value_to_show",
+        "score_word_without_a_tool",
+    ],
+)
+def test_answers_not_reporting_the_score_show_no_score_ui(run_app, replies):
+    # The question names the score, so a keyword check on the question would fail this test.
+    app = ask(connect(run_app(FakeNetwork(*replies))), "What is the Airport Opportunity Score here?")
+    assert_no_score_ui(app)
+
+
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        [text_reply("ATL scored 50.66 in the earlier result.")],
+        [function_call("rank_airports", RANK_CAGR), text_reply("ATL still has its 50.66 from before.")],
+    ],
+    ids=["no_tool", "unrelated_tool"],
+)
+def test_follow_up_restating_an_earlier_score_shows_the_score_ui(run_app, follow_up):
+    network = FakeNetwork(function_call("get_airport_profile", ATL_PROFILE), text_reply("ATL grew."), *follow_up)
+    app = ask(ask(connect(run_app(network)), "ATL?"), "And its score?")
+    assert [len(score_expanders(app.chat_message[index])) for index in (1, 3)] == [1, 0]
+
+
+def test_follow_up_with_an_unrelated_rank_shows_no_score_ui(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 5}), text_reply("ILG leads."),
+        function_call("rank_airports", RANK_CAGR), text_reply("ORD is #3 by passenger CAGR."),
+    )
+    app = ask(ask(connect(run_app(network)), "Scores?"), "Growth?")
+    assert [len(score_expanders(app.chat_message[index])) for index in (1, 3)] == [0, 1]
+
+
+def test_displayed_score_table_has_one_disclaimer_and_keeps_its_no_score_reason(run_app):
+    network = FakeNetwork(
+        function_call("compare_airports", {"airports": ["ATL", "JAC"], "table_sections": ["score"]}), text_reply("Compared."),
+    )
+    app = ask(connect(run_app(network)), "ATL and JAC?")
+    assert_score_ui_once(app)
+    assert "JAC has no score: 2022 is incomplete: 11 of 12 months reported." in [item.value for item in app.chat_message[1].caption]
+    assert any(SCORE_LABEL in set(frame.value.get("Measure", [])) for frame in app.dataframe)
+    assert "PROVISIONAL" in page_text(app)
+
+
+def test_score_table_keeps_its_caption_in_evidence_when_the_answer_shows_no_disclaimer(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}), text_reply("SFO grew 8.87% a year."),
+    )
+    app = ask(connect(run_app(network)), "SFO growth?")
+    assert_no_score_ui(app)
+    assert [item.value for item in app.caption].count(presentation.SCORE_PROXY_NOTE) == 1
+
+
+def test_command_line_tables_keep_the_score_caption():
+    result = tools.get_airport_profile("ATL", ["score"])
+    call = ToolCall("get_airport_profile", {"airport": "ATL", "table_sections": ["score"]}, result, False)
+    assert presentation.main_tables([call])[0].note == presentation.SCORE_PROXY_NOTE
+
+
+def test_each_answer_decides_for_itself(run_app):
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 1}), text_reply("ILG leads."),
+        function_call("rank_airports", RANK_CAGR), text_reply("Fastest growth."),
+        function_call("rank_opportunity_score", {"states": ["CA"], "top_n": 1}), text_reply("SFO leads."),
+    )
+    app = connect(run_app(network))
+    app.session_state["agent"].call_limit = 10
+    ask(ask(ask(app, "First"), "Second"), "Third")
+    assert_score_ui_once(app, answers=2)
+    # Newest first: the third answer, then the second, then the first.
+    assert [len(score_expanders(app.chat_message[index])) for index in (1, 3, 5)] == [1, 0, 1]
+
+
+def test_answers_without_the_score_keep_their_scope_and_caveats(run_app):
+    network = FakeNetwork(
+        function_call("rank_airports", RANK_CAGR), text_reply("Fastest growth.\n\nWarning: 2022 was a recovery year."),
+        function_call("get_long_haul_share", {"airport": "ANC", "threshold_miles": 3000}), text_reply("ANC is 2.6% long-haul."),
+    )
+    app = ask(ask(connect(run_app(network)), "Growth?"), "Long haul?")
+    text = page_text(app)
+    assert "Warning: 2022 was a recovery year." in text
+    assert "One raw metric, not an investment ranking" in text
+    assert "Full calendar years 2022 and 2025" in text
+    assert "T-100 passengers include people connecting" in text
+    assert "there is no single standard definition" in text
+    assert "The route file covers US carriers only." in text
+    assert "The threshold is an assumption" in text
+    assert_no_score_ui(app)
+
+
+def test_evidence_stays_complete_when_the_score_is_not_reported(run_app):
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}), text_reply("SFO grew 8.87% a year."),
+    )
+    app = ask(connect(run_app(network)), "SFO growth?")
+    assert_no_score_ui(app)
+    assert len(evidence_expanders(app)) == 1
+    assert any(SCORE_LABEL in set(frame.value.get("Measure", [])) for frame in app.dataframe)
+    assert "PROVISIONAL" in page_text(app)
+    assert "SFO annual inputs" in "\n".join(item.value for item in app.markdown)
+    call = app.session_state["history"][0][1].tool_calls[0]
+    assert presentation.build_evidence(call).raw["disclaimer"] == tools.SCORE_DISCLAIMER
 
 
 def test_invented_number_warning_is_shown(run_app):
