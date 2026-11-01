@@ -4,6 +4,7 @@ The scripted client stands in for the LLM in tests only; the application always
 uses the real API.
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -205,7 +206,7 @@ def test_command_line_agent_follows_the_main_table_line():
 def test_guidance_asks_for_a_reasoning_analyst_without_a_report_structure():
     assert 'Say "I\'d", take a position' in SYSTEM_PROMPT
     assert "what could make it misleading" in SYSTEM_PROMPT
-    assert "Build uncertainty and scope into your sentences" in SYSTEM_PROMPT
+    assert "specific to this result, and never as a generic disclaimer" in SYSTEM_PROMPT
     assert "When asked to choose, choose one and say why" in SYSTEM_PROMPT
     assert "cite only the few tool numbers that carry your reasoning" in SYSTEM_PROMPT
     assert 'starting with "Warning:"' not in SYSTEM_PROMPT
@@ -215,12 +216,20 @@ def test_guidance_answers_first_and_keeps_limits_for_the_conclusion():
     assert "Answer the business question first" in SYSTEM_PROMPT
     assert "Never open with methodology, data limits or what the tools cannot measure" in SYSTEM_PROMPT
     assert "your first sentence names the airports you would look at" in SYSTEM_PROMPT
-    assert "weaving in what this does not establish" in SYSTEM_PROMPT
+    assert "a brief note on what this does not establish" in SYSTEM_PROMPT
     assert "Then say what makes each one stand out" in SYSTEM_PROMPT
-    # The first-sentence limit now applies only when the question asks for a value no tool has.
-    assert "something no tool measures directly, say so in your first sentence" not in SYSTEM_PROMPT
-    assert "Only when the question asks for a value no tool measures" in SYSTEM_PROMPT
+    assert "say in your first sentence" not in SYSTEM_PROMPT
+    assert "open with what the indirect signs suggest" in SYSTEM_PROMPT
+    assert "say in that same opening that the value itself cannot be measured directly" in SYSTEM_PROMPT
+    assert "can point to pressure but never prove it" in SYSTEM_PROMPT
     assert "Never give an amount for the unmeasured thing" in SYSTEM_PROMPT
+
+
+def test_guidance_describes_the_layout_the_app_renders():
+    assert "opens with your conclusion, including any uncertainty" in SYSTEM_PROMPT
+    assert "interprets the key supporting measures in one or two sentences" in SYSTEM_PROMPT
+    assert "places results tables from the tool output between your two paragraphs" in SYSTEM_PROMPT
+    assert "directly beneath your first paragraph" not in SYSTEM_PROMPT
 
 
 def test_guidance_requires_the_scope_of_partial_figures():
@@ -289,13 +298,11 @@ def test_command_line_evidence_shows_score_disclaimer_and_small_base_warning():
     assert "WARNING: ILG: Small base year: 2022 had 4,988 passengers" in text
 
 
-SAMPLE_ANSWER = """ILG, DRO and SAF rank highest on the score among all eligible airports.
+SAMPLE_ANSWER = """ILG, DRO and SAF rank highest on the score among all eligible airports. ILG's score reflects very \
+fast growth from almost no traffic, while DRO and SAF combine strong percentage growth with high load factors.
 
-These are airports worth further investigation, not confirmed terminal needs. ILG's score reflects very fast growth \
-from almost no traffic, while DRO and SAF combine strong percentage growth with high load factors. Larger airports \
-add far more passengers, so absolute growth and CAGR tell different stories.
-
-Warning: ILG has a small base, and terminal capacity is not directly measured."""
+These are airports worth further investigation, not confirmed terminal needs: ILG has a small base, and terminal \
+capacity is not directly measured."""
 
 
 def narrative_words(text):
@@ -304,17 +311,30 @@ def narrative_words(text):
 
 def test_concise_sample_stays_within_the_word_target_and_keeps_tables_out_of_the_narrative():
     assert narrative_words(SAMPLE_ANSWER) <= 120
-    conclusion, rest = presentation.split_answer(SAMPLE_ANSWER)
-    assert conclusion.endswith("eligible airports.")
-    assert rest.startswith("These are airports")
-    assert rest.count("Warning:") == 1
+    analysis, closing = presentation.split_answer(SAMPLE_ANSWER)
+    assert analysis.endswith("high load factors.")
+    assert closing.startswith("These are airports")
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Only one paragraph.", ("Only one paragraph.", "")),
+        ("Analysis.\n\nNote.", ("Analysis.", "Note.")),
+        ("Conclusion.\n\nInterpretation.\n\nNote.", ("Conclusion.\n\nInterpretation.", "Note.")),
+        ("Conclusion.\n\n\n\nNote.\n\n", ("Conclusion.", "Note.")),
+        ("", ("", "")),
+    ],
+)
+def test_analysis_stays_together_and_only_the_last_paragraph_follows_the_tables(text, expected):
+    assert presentation.split_answer(text) == expected
 
 
 def test_command_line_answer_places_the_python_table_after_the_conclusion():
     result = tools.rank_opportunity_score([], 3)
     answer = Answer(SAMPLE_ANSWER, [ToolCall("rank_opportunity_score", {"states": [], "top_n": 3}, result, False)])
     text = cli.render_answer(answer)
-    assert text.index("eligible airports.") < text.index("#1 of 229") < text.index("These are airports")
+    assert text.index("eligible airports.") < text.index("high load factors.") < text.index("#1 of 229") < text.index("These are airports")
     assert "78.38" in text
     assert "WARNING: Small base year" not in text
 
@@ -465,6 +485,115 @@ def test_request_uses_tools_and_never_forces_one():
 )
 def test_number_check(answer, evidence, expected):
     assert find_unverified_numbers(answer, evidence) == expected
+
+
+def _sample_counts():
+    """Return each airport's departure sample and the tool result that reports it."""
+    airports = [row["airport"] for row in tools.rank_opportunity_score([], 25)["ranked"]]
+    results = {code: tools.get_airport_profile(code) for code in airports}
+    # Not every scored airport is in the on-time data, and a large count is the kind written with a comma.
+    sections = {code: result["profile"]["operational_congestion"] for code, result in results.items()}
+    counts = {code: (section["departures_in_sample"], results[code]) for code, section in sections.items() if section}
+    counts = {code: value for code, value in counts.items() if value[0] >= 1000}
+    assert len(counts) >= 2
+    return counts
+
+
+def _digit_swaps(count):
+    """List the counts a mistyped copy would produce by swapping two neighboring digits."""
+    digits = str(count)
+    swaps = [digits[:i] + digits[i + 1] + digits[i] + digits[i + 2:] for i in range(len(digits) - 1) if digits[i] != digits[i + 1]]
+    return [int(swap) for swap in swaps if swap[0] != "0"]
+
+
+def test_valid_sample_counts_pass_in_every_written_form():
+    counts = _sample_counts()
+    for code, (count, result) in counts.items():
+        other = next(other for other in counts if other != code)
+        call = ToolCall("get_airport_profile", {"airport": code}, result, False)
+        evidence = presentation.build_evidence(call)
+        sources = {
+            "profile": tools.to_json(result),
+            "comparison": tools.to_json(tools.compare_airports([code, other])),
+            # A table column mixing counts and ratios holds the count as a decimal, such as 1000.0.
+            "table": presentation._table_text(evidence.tables),
+        }
+        for form in (f"{count:,}", str(count), f"{count / 1000:.1f}K", f"{count / 1000:.1f} thousand"):
+            for name, source in sources.items():
+                assert find_unverified_numbers(f"{code} had {form} departures in the sample.", [source]) == [], (form, name)
+
+
+def test_fabricated_sample_counts_are_flagged_in_every_written_form():
+    counts = _sample_counts()
+    for code, (count, result) in counts.items():
+        evidence = tools.to_json(result)
+        other_airports = [other for other, _ in counts.values() if other != count]
+        checked = [fake for fake in [*_digit_swaps(count), count + 1, *other_airports] if str(fake) not in evidence]
+        assert len(checked) >= 2
+        for fake in checked:
+            for form in (f"{fake:,}", str(fake)):
+                answer = f"{code} had **{form}** departures, and {count:,} is the sample."
+                assert find_unverified_numbers(answer, [evidence]) == [form]
+
+
+HIDDEN = presentation.UNVERIFIED_FIGURE
+
+
+@pytest.mark.parametrize(
+    ("text", "unverified", "expected"),
+    [
+        # Repeated values.
+        ("1,234 here, 1,234 there.", ["1,234"], f"{HIDDEN} here, {HIDDEN} there."),
+        # Valid and invalid numbers together, including years and small labels.
+        ("In 2025, top 5 had 1,234 flights, 18.9% delayed.", ["1,234"], f"In 2025, top 5 had {HIDDEN} flights, 18.9% delayed."),
+        # Near matches stay, in either direction.
+        ("Counts: 1,234, 11,234, 1,234.5, 21,234.", ["1,234"], f"Counts: {HIDDEN}, 11,234, 1,234.5, 21,234."),
+        ("Counts: 1,234 and 11,234.", ["11,234"], f"Counts: 1,234 and {HIDDEN}."),
+        ("Shares: 9.9% and 9.9.", ["9.9%"], f"Shares: {HIDDEN} and 9.9."),
+        # A scale word goes with its number, and formatting and line structure stay.
+        ("Up 30 million riders.", ["30 million"], f"Up {HIDDEN} riders."),
+        ("- St. Louis: **1,234**.\n- U.S. total: 5,678.", ["1,234"], f"- St. Louis: **{HIDDEN}**.\n- U.S. total: 5,678."),
+        # Several different flagged numbers.
+        ("From 1,234 to 5,678.", ["1,234", "5,678"], f"From {HIDDEN} to {HIDDEN}."),
+    ],
+)
+def test_only_flagged_numbers_are_replaced(text, unverified, expected):
+    assert presentation.hide_unverified_numbers(text, unverified) == expected
+
+
+@pytest.mark.parametrize("text", ["In 2025, 1,234 flights, 18.9% delayed.\n\n- Top 5.", ""])
+def test_text_without_flagged_numbers_is_unchanged(text):
+    assert presentation.hide_unverified_numbers(text, []) == text
+
+
+def test_placeholder_substitutes_no_value():
+    assert not re.search(r"\d", HIDDEN)
+
+
+def test_replacing_flagged_numbers_leaves_nothing_for_the_check_to_flag():
+    code, (count, result) = next(iter(_sample_counts().items()))
+    evidence = [tools.to_json(result)]
+    text = f"{code} had {count + 1:,} departures, not {count:,}."
+    flagged = find_unverified_numbers(text, evidence)
+    assert flagged == [f"{count + 1:,}"]
+    assert find_unverified_numbers(presentation.hide_unverified_numbers(text, flagged), evidence) == []
+
+
+def test_command_line_hides_flagged_numbers_in_both_parts_of_the_answer():
+    code, (count, _) = next(iter(_sample_counts().items()))
+    fake = f"{count + 1:,}"
+    text = f"{code} had {fake} departures.\n\nThe sample of {count:,} and {fake} differ."
+    tool_input = {"airport": code, "table_sections": ["congestion"]}
+    call = ToolCall("get_airport_profile", tool_input, tools.get_airport_profile(**tool_input), False)
+    answer = Answer(text, [call], [fake])
+    rendered = cli.render_answer(answer)
+    assert fake not in rendered
+    assert rendered.count(HIDDEN) == 2
+    assert f"The sample of {count:,} and {HIDDEN} differ." in rendered
+    # The table keeps the tool's value, the warning keeps the number, and the stored answer is unchanged.
+    assert re.search(rf"Departures in sample\s+{count}(?:\.0)?\b", rendered)
+    assert fake in cli.render_evidence(answer)
+    assert answer.text == text
 
 
 def test_command_line_agent_reset_starts_a_new_conversation():

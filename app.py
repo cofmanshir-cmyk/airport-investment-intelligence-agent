@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import streamlit as st
 from google.genai import errors as gemini_errors
@@ -11,8 +12,6 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 from src import cli, gemini_agent, presentation, tools
 from src.agent import AgentError, Answer
-
-AUTOMATIC_MODEL = "Automatic (newest available)"
 
 EXAMPLES = [
     "Which airports in New England are strong candidates for terminal expansion?",
@@ -32,11 +31,12 @@ EXAMPLE_CARD_STYLE = """<style>
 
 st.set_page_config(page_title="Airport Investment Intelligence", page_icon="✈️", layout="wide")
 
+gemini_agent.enable_timing_log()
+
 state = st.session_state
 state.setdefault("agent", None)
 state.setdefault("history", [])
 state.setdefault("error", None)
-state.setdefault("models", [])
 state.setdefault("connection_error", None)
 state.setdefault("failed_question", None)
 
@@ -58,23 +58,11 @@ def use_example(question: str) -> None:
 
 
 def new_chat() -> None:
-    """Forget the conversation but keep the connection and model."""
+    """Forget the conversation but keep the connection."""
     state.agent.reset()
     state.history = []
     state.error = None
     state.failed_question = None
-
-
-def selected_model() -> str:
-    choice = state.get("model_choice", os.environ.get("GEMINI_MODEL"))
-    return choice if choice in state.models else state.models[0]
-
-
-def change_model() -> None:
-    """Start a new chat, because a conversation's history is tied to the model that wrote it."""
-    state.agent = gemini_agent.GeminiAgent(state.agent.client, selected_model())
-    state.history = []
-    state.error = None
 
 
 def retry_connection() -> None:
@@ -82,20 +70,20 @@ def retry_connection() -> None:
 
 
 def connect(key: str) -> None:
-    """List the models this key can use, which generates no content."""
+    """List the models this key can use, which generates no content, and choose them automatically."""
     try:
         client = gemini_agent.build_client(key)
-        state.models = gemini_agent.usable_models(client, os.environ.get("GEMINI_MODEL"))
+        model, fallback_model = gemini_agent.model_pair(client, os.environ.get("GEMINI_MODEL"))
     except AgentError as error:
         state.connection_error = str(error)
     except gemini_errors.APIError as error:
         state.connection_error = f"Could not connect to Gemini. {cli._gemini_error(error)}"
     else:
-        state.agent = gemini_agent.GeminiAgent(client, selected_model())
+        state.agent = gemini_agent.GeminiAgent(client, model, fallback_model)
 
 
 def ask(question: str) -> None:
-    """Make one attempt. A failure keeps the question for the user to resend, and nothing is retried automatically."""
+    """Make one attempt, which the agent may resend once to its fallback model. A failure keeps the question to resend."""
     state.failed_question = question
     try:
         answer = state.agent.ask(question)
@@ -163,32 +151,28 @@ def show_question(question: str) -> None:
 
 
 def show_answer(answer: Answer, earlier_calls: list, key: str) -> None:
-    conclusion, rest = presentation.split_answer(answer.text)
+    analysis, closing = presentation.split_answer(answer.text)
     reports_score = presentation.reports_opportunity_score(
-        answer.tool_calls, f"{conclusion}\n\n{rest}", earlier_calls, answer.primary_table
+        answer.tool_calls, f"{analysis}\n\n{closing}", earlier_calls, answer.primary_table
     )
 
     def displayed(tables: list[presentation.Table]) -> list[presentation.Table]:
         return presentation.without_score_proxy_note(tables) if reports_score else tables
 
     with st.chat_message("assistant"):
-        st.markdown(presentation.escape_markdown(conclusion))
-        for table in presentation.with_short_ranks(
+        st.markdown(presentation.escape_markdown(presentation.hide_unverified_numbers(analysis, answer.unverified_numbers)))
+        for table in presentation.with_contextual_headings(presentation.with_short_ranks(
             displayed(presentation.main_tables(answer.tool_calls, answer.primary_table, answer.text))
-        ):
+        )):
             st.markdown(f"**{table.title}**")
             st.dataframe(table.data, hide_index=True, width="stretch")
             if table.note:
                 st.caption(table.note)
-        if rest:
-            st.markdown(presentation.escape_markdown(rest))
+        if closing:
+            st.markdown(presentation.escape_markdown(presentation.hide_unverified_numbers(closing, answer.unverified_numbers)))
         notice = presentation.small_base_notice(answer.tool_calls, answer.text)
         if notice:
             st.warning(notice, icon="⚠️")
-        if answer.unverified_numbers:
-            st.warning(
-                "These numbers do not match any tool result, so verify them: " + ", ".join(answer.unverified_numbers)
-            )
         if not answer.tool_calls:
             st.warning("No tool was called, so no data result supports this answer.")
         if reports_score:
@@ -206,19 +190,6 @@ def show_answer(answer: Answer, earlier_calls: list, key: str) -> None:
 api_key = server_api_key()
 if api_key and state.agent is None and state.connection_error is None:
     connect(api_key)
-
-with st.sidebar:
-    if state.agent is not None:
-        preferred = os.environ.get("GEMINI_MODEL")
-        options = [AUTOMATIC_MODEL, *state.models]
-        st.selectbox(
-            "Model",
-            options,
-            index=options.index(preferred) if preferred in options else 0,
-            key="model_choice",
-            on_change=change_model,
-            help="Changing the model starts a new chat.",
-        )
 
 title_column, action_column = st.columns([5, 1], vertical_alignment="center")
 with title_column:
@@ -257,10 +228,13 @@ if not state.history and not submitted and not state.failed_question:
                     width="stretch",
                 )
 
+render_started = time.perf_counter()
 for position, (question, answer) in enumerate(state.history):
     earlier_calls = [call for _, earlier in state.history[:position] for call in earlier.tool_calls]
     show_question(question)
     show_answer(answer, earlier_calls, key=str(position))
+if state.history:
+    gemini_agent.log_timing("page_render", answers=len(state.history), duration_ms=gemini_agent.elapsed_ms(render_started))
 
 if submitted:
     # Drawn once while waiting. The rerun then draws it from the history, so nothing appears twice.

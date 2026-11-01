@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(
     reason="Processed data not built",
 )
 
-PRODUCTION = ["app.py", *[f"src/{name}.py" for name in ("agent", "cli", "gemini_agent", "presentation", "scoring", "tools", "analytics")]]
+PRODUCTION = ["app.py", *[f"src/{name}.py" for name in ("agent", "cli", "gemini_agent", "grounding", "presentation", "scoring", "tools", "analytics")]]
 GROWTH = "rank_airports"
 NEUTRAL_TEXT = "An answer that states no score."
 
@@ -302,8 +302,19 @@ def test_example_questions_are_only_display_text():
 
 
 def test_no_code_reads_the_words_of_the_question():
-    for name in ("app.py", "src/agent.py", "src/gemini_agent.py", "src/presentation.py"):
+    for name in ("app.py", "src/agent.py", "src/gemini_agent.py", "src/grounding.py", "src/presentation.py"):
         text = source(name)
         assert "question.lower" not in text and "question.casefold" not in text
         assert " in question" not in text
         assert "re.search(question" not in text
+
+
+def test_question_is_read_only_to_find_catalog_airports_and_never_picks_a_tool():
+    """The one exception to the rule above: finding airports decides what must be covered, not how."""
+    text = source("src/grounding.py")
+    for tool in tools.TOOL_DEFINITIONS:
+        assert tool["name"] not in text
+    for name in ("app.py", "src/agent.py", "src/presentation.py", "src/gemini_agent.py"):
+        assert "_coded_airports" not in source(name) and "_named_airports" not in source(name)
+    agent_source = source("src/gemini_agent.py")
+    assert "tool_choice" not in agent_source and "allowed_function_names" not in agent_source

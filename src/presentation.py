@@ -9,10 +9,11 @@ from dataclasses import dataclass, field, replace
 import pandas as pd
 
 from . import scoring, tools
-from .agent import RANKING_TOOLS, ToolCall, find_unverified_numbers, primary_ranking
+from .agent import NUMBER, RANKING_TOOLS, ToolCall, find_unverified_numbers, primary_ranking
 
 PROVISIONAL_PREFIX = "PROVISIONAL"
 SMALL_BASE_PREFIX = "Small base"
+UNVERIFIED_FIGURE = "[figure not verified]"
 
 TOOL_LABELS = {
     "rank_opportunity_score": "Airport Opportunity Score",
@@ -63,6 +64,11 @@ SCORE_TABLE_TITLE = "Airport Opportunity Score"
 DEMAND_TABLE_TITLE = "Demand-pressure proxies"
 SCORE_PROXY_NOTE = "Preliminary screening proxy, not an investment recommendation."
 POSITION_LABEL = "Position in this list"
+_MAIN_TABLE_HEADINGS = {
+    "Operational congestion": "Congestion indicators",
+    DEMAND_TABLE_TITLE: "Demand indicators (proxies)",
+    "Cargo context, not scored": "Cargo context (not scored)",
+}
 
 SCORE_COLUMNS = {
     "national_rank": "National rank",
@@ -186,7 +192,7 @@ def _airport_sections(profiles: dict[str, dict]) -> dict[str, list[Table]]:
         "congestion": [_section_table(
             "Operational congestion",
             congestion_rows,
-            f"{year_note} Separate from the demand proxies; the two are never merged.".strip(),
+            f"{year_note} Reporting carriers on domestic flights only.".strip(),
         )],
         "cargo": [_section_table(
             "Cargo context, not scored",
@@ -314,13 +320,26 @@ def small_base_alerts(calls: list[ToolCall]) -> list[str]:
 
 
 def split_answer(text: str) -> tuple[str, str]:
-    """Separate the first paragraph from the rest, so the table can sit between them.
+    """Separate the analysis from the closing note, so the tables can sit between them.
 
-    Results tables come only from tool output, so any table the model writes is removed.
+    The last paragraph is the note, and everything before it stays together above the tables. A
+    single paragraph is all analysis. Results tables come only from tool output, so any table the
+    model writes is removed.
     """
     lines = [line for line in text.splitlines() if not line.lstrip().startswith("|")]
-    parts = re.split(r"\n\s*\n", "\n".join(lines).strip(), maxsplit=1)
-    return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
+    parts = [part.strip() for part in re.split(r"\n\s*\n", "\n".join(lines).strip()) if part.strip()]
+    if len(parts) < 2:
+        return (parts[0] if parts else ""), ""
+    return "\n\n".join(parts[:-1]), parts[-1]
+
+
+def hide_unverified_numbers(text: str, unverified: list[str]) -> str:
+    """Replace flagged numbers for display, so the text never states them as facts.
+
+    No value is substituted, because the check can't tell which returned value was meant. The stored
+    answer keeps the original text, and surrounding words stay as written.
+    """
+    return NUMBER.sub(lambda match: UNVERIFIED_FIGURE if match.group(0) in unverified else match.group(0), text)
 
 
 def _passenger_growth_table(profiles: dict[str, dict]) -> Table:
@@ -464,6 +483,19 @@ def main_tables(calls: list[ToolCall], preferred: str | None = None, narrative: 
 def with_short_ranks(tables: list[Table]) -> list[Table]:
     """Show "#1" rather than "#1 of 229". The evidence tables keep the full form."""
     return [replace(table, data=table.data.replace(r"^(#\d+) of \d+$", r"\1", regex=True)) for table in tables]
+
+
+def with_contextual_headings(tables: list[Table]) -> list[Table]:
+    """Say what each airport table shows and for whom. Evidence and rankings keep their own titles."""
+    def airports(codes: list[str]) -> str:
+        return " and ".join(codes) if len(codes) < 3 else f"{', '.join(codes[:-1])} and {codes[-1]}"
+
+    return [
+        replace(table, title=f"{_MAIN_TABLE_HEADINGS.get(table.title, table.title)} for {airports(list(table.data.columns[1:]))}")
+        if "Measure" in table.data.columns
+        else table
+        for table in tables
+    ]
 
 
 def _returned_scores(calls: list[ToolCall]) -> list[tuple[float, int, int]]:

@@ -13,10 +13,10 @@ from google.genai import errors, types
 from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit.runtime.secrets import Secrets
 from streamlit.testing.v1 import AppTest
-from streamlit.testing.v1.element_tree import Caption, Dataframe, Markdown
+from streamlit.testing.v1.element_tree import Caption, Dataframe, Expander, Markdown
 
 from src import cli, config, gemini_agent, presentation
-from src.agent import ToolCall
+from src.agent import Answer, ToolCall
 from src import tools
 
 pytestmark = pytest.mark.skipif(
@@ -52,8 +52,8 @@ class FakeNetwork:
         self.keys_seen.append(request.headers.get("x-goog-api-key"))
         if request.method == "GET":
             return httpx.Response(200, json={"models": [
-                {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": f"models/{model}", "supportedGenerationMethods": ["generateContent"]}
+                for model in sorted(gemini_agent.PREFERRED_MODELS)
             ]})
         self.generate_calls += 1
         self.urls.append(str(request.url))
@@ -179,7 +179,7 @@ def test_score_answer_explains_the_score_beneath_the_answer(run_app):
     assert len(assistant.info) == 1 and len(score_expanders(assistant)) == 1
     children = list(assistant.children.values())
     position = lambda wanted: next(index for index, child in enumerate(children) if child is wanted)
-    insight = next(child for child in assistant.markdown if child.value.startswith("Insight one."))
+    insight = next(child for child in assistant.markdown if child.value.endswith("Insight one."))
     evidence = evidence_expanders(assistant)[0]
     assert position(insight) < position(assistant.info[0]) < position(score_expanders(assistant)[0]) < position(evidence)
     assert position(evidence) == len(children) - 1
@@ -328,7 +328,7 @@ def test_connection_failure_is_explained_without_crashing_and_can_be_retried(run
     assert len(network.keys_seen) == 0
     button(app, "Try again").click().run()
     assert not app.exception and not app.error
-    assert app.session_state["agent"].model == "gemini-3.8-flash"
+    assert app.session_state["agent"].model == "gemini-3.5-flash-lite"
 
 
 def test_listing_timeout_is_explained_without_crashing(run_app):
@@ -340,10 +340,10 @@ def test_listing_timeout_is_explained_without_crashing(run_app):
     assert app.session_state["agent"] is None
 
 
-def test_sidebar_has_only_the_model_selector_and_no_removed_controls(run_app):
+def test_sidebar_is_empty_and_removed_controls_stay_removed(run_app):
     network = FakeNetwork(text_reply("Hello."))
     app = ask(run_app(network), "Hello")
-    assert sidebar_labels(app) == ["Model"]
+    assert sidebar_labels(app) == []
     assert not list(app.metric)
     assert not list(app.success)
     assert "Minimum 2025 departing passengers" not in str(app.main)
@@ -372,14 +372,60 @@ def test_readme_keeps_the_data_sources_removed_from_the_sidebar():
         assert detail in readme
 
 
-def test_model_selector_offers_automatic_and_only_available_models_without_generating(run_app):
+def test_models_are_chosen_automatically_with_no_selector_or_model_names(run_app):
     network = FakeNetwork()
     app = run_app(network)
-    box = next(item for item in app.selectbox if item.label == "Model")
-    assert box.options == ["Automatic (newest available)", "gemini-3.8-flash", "gemini-3.6-flash"]
-    assert box.value == "Automatic (newest available)"
-    assert app.session_state["agent"].model == "gemini-3.8-flash"
+    assert not list(app.selectbox)
+    assert sidebar_labels(app) == []
+    assert app.session_state["agent"].model == "gemini-3.5-flash-lite"
+    assert "gemini-3" not in page_text(app)
     assert network.generate_calls == 0
+
+
+def test_model_specific_failure_falls_back_without_showing_anything(run_app):
+    network = FakeNetwork(quota_error(PER_MODEL), text_reply("Answered."))
+    network.statuses = [429, 200]
+    app = ask(run_app(network), "Question")
+    assert not app.error
+    assert [item.markdown[0].value for item in assistant_messages(app)] == ["Answered."]
+    assert ["gemini-3.5-flash-lite" in network.urls[0], "gemini-3.1-flash-lite" in network.urls[1]] == [True, True]
+    assert "gemini-3" not in page_text(app)
+
+
+def test_both_models_unavailable_shows_a_simple_message_and_keeps_the_question(run_app):
+    network = FakeNetwork(quota_error(PER_MODEL), quota_error(PER_MODEL), status=429)
+    app = ask(run_app(network), "My exact question")
+    # Four models are listed, but only the default and its one fallback are ever tried.
+    assert network.generate_calls == 2
+    assert ["gemini-3.5-flash-lite" in network.urls[0], "gemini-3.1-flash-lite" in network.urls[1]] == [True, True]
+    assert app.error[0].value == gemini_agent.MODELS_UNAVAILABLE_MESSAGE
+    assert "model" not in app.error[0].value.lower()
+    assert "RAW GOOGLE TEXT" not in page_text(app)
+    assert not list(app.selectbox)
+    assert button(app, "Ask again")
+    app.run()
+    assert network.generate_calls == 2
+
+
+def test_no_usable_model_at_connection_shows_the_simple_message(run_app):
+    class NoModels(FakeNetwork):
+        def __call__(self, request):
+            return httpx.Response(200, json={"models": []})
+
+    app = run_app(NoModels())
+    assert app.error[0].value == gemini_agent.MODELS_UNAVAILABLE_MESSAGE
+    assert FAKE_KEY not in page_text(app)
+
+
+def test_new_chat_returns_to_the_preferred_model(run_app):
+    network = FakeNetwork(quota_error(PER_MODEL), text_reply("Answered."), text_reply("Fresh."))
+    network.statuses = [429, 200, 200]
+    app = ask(run_app(network), "Question")
+    assert app.session_state["agent"].model == "gemini-3.1-flash-lite"
+    button(app, "New Chat").click().run()
+    assert app.session_state["agent"].model == "gemini-3.5-flash-lite"
+    ask(app, "Another")
+    assert "gemini-3.5-flash-lite" in network.urls[-1]
 
 
 def test_models_are_listed_once_across_reruns(run_app):
@@ -391,19 +437,7 @@ def test_models_are_listed_once_across_reruns(run_app):
     assert len(network.keys_seen) == listed == 1
 
 
-def test_choosing_a_model_uses_it_and_starts_a_new_chat(run_app):
-    network = RecordingNetwork(text_reply("First."), text_reply("Second."))
-    app = ask(run_app(network), "First")
-    next(item for item in app.selectbox if item.label == "Model").set_value("gemini-3.6-flash").run()
-    assert not app.exception
-    assert app.session_state["agent"].model == "gemini-3.6-flash"
-    assert app.session_state["history"] == []
-    assert sorted(card_questions(app)) == sorted(EXAMPLE_CARDS)
-    ask(app, "Second")
-    assert [item["role"] for item in network.bodies[-1]["contents"]] == ["user"]
-
-
-def test_configured_model_is_preselected_and_used(run_app, monkeypatch):
+def test_configured_model_is_used_first(run_app, monkeypatch):
     network = FakeNetwork()
     monkeypatch.setenv("GEMINI_API_KEY", FAKE_KEY)
     app = AppTest.from_file(APP_PATH, default_timeout=60)
@@ -413,7 +447,7 @@ def test_configured_model_is_preselected_and_used(run_app, monkeypatch):
         retry_options=types.HttpRetryOptions(attempts=1),
     )))
     app.run()
-    assert next(item for item in app.selectbox if item.label == "Model").value == "gemini-3.6-flash"
+    assert not list(app.selectbox)
     assert app.session_state["agent"].model == "gemini-3.6-flash"
 
 
@@ -439,22 +473,20 @@ KEY_WIDE = {"quotaId": "GenerateRequestsPerDayPerProject", "quotaDimensions": {"
 
 
 @pytest.mark.parametrize(
-    "violations, expected, unexpected",
+    "violations, expected",
     [
-        ((PER_MODEL,), "selected model may have reached its usage limit", "may not help"),
-        ((PER_MODEL_BY_ID,), "selected model may have reached its usage limit", "may not help"),
-        ((KEY_WIDE,), "switching models may not help", "Try another available model"),
-        ((PER_MODEL, KEY_WIDE), "switching models may not help", "Try another available model"),
-        ((), "unless the limit applies to the whole API key", "selected model may have"),
+        ((KEY_WIDE,), "This API key has reached a usage limit"),
+        ((PER_MODEL, KEY_WIDE), "This API key has reached a usage limit"),
+        ((), "Gemini's usage limit has been reached"),
     ],
-    ids=["model_dimension", "model_in_id", "key_wide", "mixed", "unspecified"],
+    ids=["key_wide", "mixed", "unspecified"],
 )
-def test_quota_message_matches_the_scope_of_the_limit(run_app, violations, expected, unexpected):
+def test_quota_that_may_cover_every_model_is_not_retried(run_app, violations, expected):
     network = FakeNetwork(quota_error(*violations), status=429)
     app = ask(run_app(network), "Question")
     message = app.error[0].value
     assert expected in message
-    assert unexpected not in message
+    assert "model" not in message.lower()
     assert "RAW GOOGLE TEXT" not in page_text(app)
     assert network.generate_calls == 1
     app.run()
@@ -462,12 +494,12 @@ def test_quota_message_matches_the_scope_of_the_limit(run_app, violations, expec
 
 
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
-def test_overload_suggests_waiting_or_another_model(run_app, status_code):
+def test_overload_that_names_no_model_suggests_waiting_and_is_not_retried(run_app, status_code):
     network = FakeNetwork({"error": {"code": status_code, "message": "RAW GOOGLE TEXT", "status": "UNAVAILABLE"}}, status=status_code)
     app = ask(run_app(network), "Question")
     message = app.error[0].value
     assert "temporarily overloaded or unavailable" in message
-    assert "another available model" in message
+    assert "model" not in message.lower()
     assert "RAW GOOGLE TEXT" not in page_text(app)
     assert network.generate_calls == 1
 
@@ -482,12 +514,14 @@ def test_overload_suggests_waiting_or_another_model(run_app, status_code):
     ],
     ids=["forbidden", "unauthenticated", "invalid_key", "failed_precondition"],
 )
-def test_key_or_setup_problems_do_not_suggest_switching_models(run_app, status_code, body):
-    app = ask(run_app(FakeNetwork({"error": body}, status=status_code)), "Question")
+def test_key_or_setup_problems_point_to_the_configuration_and_are_not_retried(run_app, status_code, body):
+    network = FakeNetwork({"error": body}, status=status_code)
+    app = ask(run_app(network), "Question")
     message = app.error[0].value
-    assert "Switching models won't help" in message
-    assert "Try another" not in message
+    assert "API key" in message
+    assert "model" not in message.lower()
     assert "RAW GOOGLE TEXT" not in page_text(app)
+    assert network.generate_calls == 1
 
 
 def test_other_errors_show_a_friendly_message_without_raw_text(run_app):
@@ -506,7 +540,7 @@ def test_unusual_error_details_do_not_break_the_message():
 
 
 def test_failed_question_stays_visible_and_is_not_resent_until_asked(run_app):
-    network = FakeNetwork(quota_error(PER_MODEL), text_reply("Now answered."))
+    network = FakeNetwork(quota_error(KEY_WIDE), text_reply("Now answered."))
     network.statuses = [429, 200]
     app = ask(run_app(network), "My exact question")
     assert app.session_state["failed_question"] == "My exact question"
@@ -526,25 +560,8 @@ def test_failed_question_stays_visible_and_is_not_resent_until_asked(run_app):
     assert not [item for item in app.button if item.label == "Ask again"]
 
 
-def test_failed_question_survives_a_model_change_without_being_sent(run_app):
-    network = RecordingNetwork(quota_error(PER_MODEL), text_reply("Answered by the other model."))
-    network.statuses = [429, 200]
-    app = ask(run_app(network), "My exact question")
-    next(item for item in app.selectbox if item.label == "Model").set_value("gemini-3.6-flash").run()
-    assert not app.exception
-    assert network.generate_calls == 1
-    assert not app.error
-    assert [item.markdown[0].value for item in user_messages(app)] == ["My exact question"]
-
-    button(app, "Ask again").click().run()
-    assert network.generate_calls == 2
-    assert "gemini-3.6-flash" in network.urls[-1]
-    assert [item["role"] for item in network.bodies[-1]["contents"]] == ["user"]
-    assert network.bodies[-1]["contents"][0]["parts"][0]["text"] == "My exact question"
-
-
 def test_typing_a_new_question_replaces_the_failed_one(run_app):
-    network = FakeNetwork(quota_error(PER_MODEL), text_reply("Answered."))
+    network = FakeNetwork(quota_error(KEY_WIDE), text_reply("Answered."))
     network.statuses = [429, 200]
     app = ask(ask(run_app(network), "Old question"), "New question")
     assert network.generate_calls == 2
@@ -553,7 +570,7 @@ def test_typing_a_new_question_replaces_the_failed_one(run_app):
 
 
 def test_failed_follow_up_keeps_earlier_answers_and_comes_last(run_app):
-    network = FakeNetwork(text_reply("First answer."), quota_error(PER_MODEL))
+    network = FakeNetwork(text_reply("First answer."), quota_error(KEY_WIDE))
     network.statuses = [200, 429]
     app = ask(ask(run_app(network), "First"), "Second")
     assert [item.markdown[0].value for item in user_messages(app)] == ["First", "Second"]
@@ -562,7 +579,7 @@ def test_failed_follow_up_keeps_earlier_answers_and_comes_last(run_app):
 
 
 def test_new_chat_clears_a_failed_question(run_app):
-    app = ask(run_app(FakeNetwork(quota_error(PER_MODEL), status=429)), "Question")
+    app = ask(run_app(FakeNetwork(quota_error(KEY_WIDE), status=429)), "Question")
     button(app, "New Chat").click().run()
     assert app.session_state["failed_question"] is None
     assert not list(app.chat_message) and not app.error
@@ -588,21 +605,203 @@ def test_tables_use_the_native_scrolling_table_and_the_only_style_is_scoped_to_t
     assert source.count(".st-key-example-cards") == 2
 
 
-@pytest.mark.parametrize("question", EXAMPLE_CARDS)
-def test_card_click_sends_its_exact_question_once_through_the_agent(run_app, question):
-    network = RecordingNetwork(text_reply("A reply that only the agent could return."))
+@pytest.mark.parametrize(
+    "question, tool_reply",
+    list(zip(EXAMPLE_CARDS, [
+        function_call("rank_opportunity_score", {"states": ["CT", "MA", "ME", "NH", "RI", "VT"], "top_n": 3}),
+        function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["congestion"]}),
+        function_call("get_long_haul_share", {"airport": "ANC", "threshold_miles": 3000}),
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}),
+    ])),
+)
+def test_card_click_sends_its_exact_question_once_through_the_agent(run_app, question, tool_reply):
+    network = RecordingNetwork(tool_reply, text_reply("A reply that only the agent could return."))
     app = connect(run_app(network))
     next(item for item in app.button if item.label == question).click().run()
     assert not app.exception
-    assert network.generate_calls == 1
+    assert network.generate_calls == 2
     assert network.bodies[0]["contents"][-1]["parts"][0]["text"] == question
     assert app.session_state["history"][0][0] == question
     assert [item.markdown[0].value for item in user_messages(app)] == [question]
     assert assistant_messages(app)[0].markdown[0].value == "A reply that only the agent could return."
     assert card_questions(app) == []
     app.run()
-    assert network.generate_calls == 1
+    assert network.generate_calls == 2
     assert len(user_messages(app)) == 1
+
+
+def layout(message):
+    """List a message's direct contents in display order, leaving out what is inside its expanders."""
+    def entry(child):
+        if isinstance(child, Caption):
+            return ("caption", child.value)
+        if isinstance(child, Markdown):
+            return ("text", child.value)
+        if isinstance(child, Dataframe):
+            return ("table", None)
+        return ("expander", child.label) if isinstance(child, Expander) else ("other", None)
+
+    return [entry(child) for child in message.children.values()]
+
+
+LAYOUT_ANALYSIS = "Traffic pressure looks moderate, though the signs are mixed. Growth is steady and delays run close to average."
+LAYOUT_NOTE = "This does not establish capacity limits, so I'd check gate and slot data next."
+LAYOUT_TURNS = {
+    "comparison": (function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["congestion"]}), "Congestion indicators for LAX and SNA"),
+    "profile": (function_call("get_airport_profile", {"airport": "ORD", "table_sections": ["passenger_growth"]}), "Passenger growth for ORD"),
+    "demand": (function_call("get_airport_profile", {"airport": "DEN", "table_sections": ["demand"]}), "Demand indicators (proxies) for DEN"),
+    "ranking": (function_call("rank_airports", {"window_years": 3, "states": ["MA"], "top_n": 3, "min_enplanements": 100000}), "Ranked by Passenger CAGR 3Y"),
+    "long_haul": (function_call("get_long_haul_share", {"airport": "ANC", "threshold_miles": 3000}), "ANC long-haul share"),
+}
+
+
+@pytest.mark.parametrize("turn", LAYOUT_TURNS)
+def test_analysis_comes_first_then_tables_under_a_heading_then_the_note_then_evidence(run_app, turn):
+    tool_reply, heading = LAYOUT_TURNS[turn]
+    network = FakeNetwork(tool_reply, text_reply(f"{LAYOUT_ANALYSIS}\n\n{LAYOUT_NOTE}"))
+    items = layout(assistant_messages(ask(connect(run_app(network)), "Question"))[0])
+    kinds = [kind for kind, _ in items]
+    assert items[0] == ("text", LAYOUT_ANALYSIS)
+    assert items[1] == ("text", f"**{heading}**")
+    assert kinds[2] == "table"
+    note_at = items.index(("text", LAYOUT_NOTE))
+    assert note_at > kinds.index("table")
+    assert kinds.index("expander") > note_at
+    assert kinds[-1] == "expander"
+
+
+def test_interpretation_in_its_own_paragraph_stays_above_the_table(run_app):
+    network = FakeNetwork(LAYOUT_TURNS["comparison"][0], text_reply(f"Conclusion.\n\nInterpretation.\n\n{LAYOUT_NOTE}"))
+    items = layout(assistant_messages(ask(connect(run_app(network)), "Question"))[0])
+    assert items[0] == ("text", "Conclusion.\n\nInterpretation.")
+    assert [kind for kind, _ in items].index("table") == 2
+    assert items.index(("text", LAYOUT_NOTE)) > 2
+
+
+def test_single_paragraph_answer_keeps_all_its_text_above_the_table(run_app):
+    network = FakeNetwork(LAYOUT_TURNS["comparison"][0], text_reply(LAYOUT_ANALYSIS))
+    items = layout(assistant_messages(ask(connect(run_app(network)), "Question"))[0])
+    assert items[0] == ("text", LAYOUT_ANALYSIS)
+    assert [value for _, value in items].count(LAYOUT_ANALYSIS) == 1
+
+
+def test_answer_about_an_unmeasurable_quantity_leads_with_the_proxies_not_a_table(run_app):
+    opening = (
+        "The indirect signs point to some pressure at DEN, though unmet demand itself can't be measured directly. "
+        "Growth and a high load factor are consistent with that, without proving it."
+    )
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "DEN", "table_sections": ["demand"]}),
+        text_reply(f"{opening}\n\nI'd check gate use and fares before calling this constrained."),
+    )
+    answer = assistant_messages(ask(connect(run_app(network)), "What is the unmet demand at DEN?"))[0]
+    items = layout(answer)
+    assert items[0] == ("text", opening)
+    assert items[1] == ("text", "**Demand indicators (proxies) for DEN**")
+    assert [kind for kind, _ in items][2] == "table"
+    assert ("text", "I'd check gate use and fares before calling this constrained.") in items
+    assert not list(answer.warning)
+
+
+def test_several_tables_each_get_a_heading_and_stay_between_analysis_and_note(run_app):
+    network = FakeNetwork(
+        function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["passenger_growth", "congestion"]}),
+        text_reply(f"LAX and SNA differ. {LAYOUT_ANALYSIS}\n\n{LAYOUT_NOTE}"),
+    )
+    items = layout(assistant_messages(ask(connect(run_app(network)), "Compare"))[0])
+    values = [value for _, value in items]
+    growth, congestion = values.index("**Passenger growth for LAX and SNA**"), values.index("**Congestion indicators for LAX and SNA**")
+    assert 0 < growth < congestion < values.index(LAYOUT_NOTE)
+    assert [kind for kind, _ in items][growth + 1] == "table" and [kind for kind, _ in items][congestion + 1] == "table"
+
+
+def test_evidence_keeps_its_own_titles_while_the_main_table_gets_a_contextual_heading(run_app):
+    network = FakeNetwork(LAYOUT_TURNS["comparison"][0], text_reply(f"LAX and SNA differ.\n\n{LAYOUT_NOTE}"))
+    answer = assistant_messages(ask(connect(run_app(network)), "Compare"))[0]
+    assert "**Operational congestion**" in [item.value for item in evidence_expanders(answer)[0].markdown]
+    assert "**Operational congestion**" not in [item.value for item in direct(answer, Markdown)]
+
+
+def test_congestion_caption_states_its_scope():
+    calls = [ToolCall("compare_airports", {}, tools.compare_airports(["LAX", "SNA"], ["congestion"]), False)]
+    assert presentation.main_tables(calls)[0].note == "Calendar 2025. Reporting carriers on domestic flights only."
+
+
+@pytest.mark.parametrize(
+    "columns, heading",
+    [
+        (["Measure", "SFO"], "Congestion indicators for SFO"),
+        (["Measure", "LAX", "SNA"], "Congestion indicators for LAX and SNA"),
+        (["Measure", "LAX", "SNA", "SFO"], "Congestion indicators for LAX, SNA and SFO"),
+    ],
+)
+def test_heading_names_the_airports_the_table_covers(columns, heading):
+    table = presentation.Table("Operational congestion", pd.DataFrame(columns=columns))
+    assert presentation.with_contextual_headings([table])[0].title == heading
+    assert table.title == "Operational congestion"
+
+
+def test_tables_without_airport_columns_keep_their_titles():
+    table = presentation.Table("Ranked by Passenger CAGR 3Y", pd.DataFrame(columns=["Airport", "Passenger CAGR 3Y (%)"]))
+    assert presentation.with_contextual_headings([table])[0].title == "Ranked by Passenger CAGR 3Y"
+
+
+def test_command_line_uses_the_same_order_and_headings():
+    call = ToolCall("compare_airports", {}, tools.compare_airports(["LAX", "SNA"], ["congestion"]), False)
+    rendered = cli.render_answer(Answer(f"{LAYOUT_ANALYSIS}\n\n{LAYOUT_NOTE}", [call]))
+    assert rendered.index(LAYOUT_ANALYSIS) < rendered.index("Congestion indicators for LAX and SNA") < rendered.index(LAYOUT_NOTE)
+
+
+GROUNDING_QUESTION = "What is the unmet flight demand in SFO airport and why?"
+UNSUPPORTED_DRAFT = "Unmet demand there is about 4 million passengers because the runways are full."
+
+
+def test_answer_that_skipped_the_tool_is_replaced_by_one_grounded_in_data(run_app):
+    network = RecordingNetwork(
+        text_reply(UNSUPPORTED_DRAFT),
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": ["passenger_growth"]}),
+        text_reply("Unmet demand can't be measured directly here, so I'd look at SFO's growth and load factor instead."),
+    )
+    app = ask(connect(run_app(network)), GROUNDING_QUESTION)
+    assert UNSUPPORTED_DRAFT not in page_text(app)
+    assert "can't be measured directly" in page_text(app)
+    assert "No tool was called" not in page_text(app)
+    assert network.generate_calls == 3
+    assert len(evidence_expanders(assistant_messages(app)[0])) == 1
+    assert "tool `get_airport_profile`" in "\n".join(item.value for item in app.markdown)
+
+
+def test_answer_with_no_data_is_withheld_and_can_be_asked_again(run_app):
+    network = RecordingNetwork(
+        text_reply(UNSUPPORTED_DRAFT),
+        text_reply(UNSUPPORTED_DRAFT),
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}),
+        text_reply("SFO's indirect signs are in the data."),
+    )
+    app = ask(connect(run_app(network)), GROUNDING_QUESTION)
+    assert UNSUPPORTED_DRAFT not in page_text(app)
+    assert not assistant_messages(app)
+    assert "couldn't retrieve data for SFO" in app.error[0].value
+    assert [item.markdown[0].value for item in user_messages(app)] == [GROUNDING_QUESTION]
+    assert app.session_state["history"] == []
+    assert network.generate_calls == 2
+    app.run()
+    assert network.generate_calls == 2
+
+    button(app, "Ask again").click().run()
+    assert not app.error
+    assert network.generate_calls == 4
+    assert [item.markdown[0].value for item in assistant_messages(app)] == ["SFO's indirect signs are in the data."]
+    assert UNSUPPORTED_DRAFT not in json.dumps(network.bodies[-1]["contents"])
+
+
+def test_general_method_question_is_answered_without_a_tool_and_says_so(run_app):
+    network = FakeNetwork(text_reply("Load factor is passengers divided by seats."))
+    app = ask(connect(run_app(network)), "What does load factor mean?")
+    assert network.generate_calls == 1
+    assert "Load factor is passengers divided by seats." in page_text(app)
+    assert "No tool was called" in page_text(app)
+    assert not app.error
 
 
 def test_first_question_shows_one_question_then_one_answer(run_app):
@@ -705,12 +904,12 @@ def test_main_message_has_no_duplicate_tables(run_app):
     )
     app = ask(connect(run_app(network)), "Compare")
     assert len(main_frames(assistant_messages(app)[0])) == 1
-    assert [item.value for item in direct(assistant_messages(app)[0], Markdown)].count("**Operational congestion**") == 1
+    assert [item.value for item in direct(assistant_messages(app)[0], Markdown)].count("**Congestion indicators for LAX and SNA**") == 1
 
 
 def test_unmet_demand_stays_indirect_in_instructions_and_data():
     assert "Never give an amount for the unmeasured thing" in gemini_agent.SYSTEM_PROMPT
-    assert "say in your first sentence that you cannot give it" in gemini_agent.SYSTEM_PROMPT
+    assert "say in that same opening that the value itself cannot be measured directly" in gemini_agent.SYSTEM_PROMPT
     assert "unmet demand" in gemini_agent.SYSTEM_PROMPT
     metrics = tools.get_airport_profile("SFO")["profile"]["demand_pressure_proxies"]["metrics"]
     assert not [name for name in metrics if "unmet" in name]
@@ -848,8 +1047,7 @@ def test_answer_separates_conclusion_and_insights_around_the_python_table(run_ap
     )
     app = ask(connect(run_app(network)), "Top scores?")
     values = [item.value for item in app.markdown]
-    assert "ILG scores highest." in values
-    insight = next(value for value in values if value.startswith("Insight one."))
+    insight = next(value for value in values if value == "ILG scores highest.\n\nInsight one.")
     assert "99" not in insight and "| Airport" not in " ".join(values)
     assert next(frame.value for frame in app.dataframe if SCORE_LABEL in frame.value.columns).iloc[0][SCORE_LABEL] == 78.38
 
@@ -1762,13 +1960,101 @@ def test_answers_without_the_score_keep_their_scope_and_caveats(run_app):
     assert_no_score_ui(app)
 
 
-def test_invented_number_warning_is_shown(run_app):
+def test_invented_number_is_hidden_and_flagged_with_no_banner(run_app):
     network = FakeNetwork(
         function_call("get_airport_profile", {"airport": "SFO"}),
         text_reply("SFO has 1,234,567 unmet passengers."),
     )
     app = ask(connect(run_app(network)), "Unmet demand at SFO?")
-    assert "1,234,567" in " ".join(item.value for item in app.warning)
+    # The check still runs and the number is still hidden, but nothing about it reaches the page.
+    assert app.session_state["history"][0][1].unverified_numbers == ["1,234,567"]
+    assert "1,234,567" not in page_text(app)
+    assert f"SFO has {presentation.UNVERIFIED_FIGURE} unmet passengers." in page_text(app)
+    assert "do not match any tool result" not in page_text(app)
+
+
+def test_removing_the_number_banner_keeps_other_notes_and_the_score_disclaimer(run_app):
+    code = tools.rank_opportunity_score([], 1)["ranked"][0]["airport"]
+    score = tools.get_airport_profile(code)["profile"]["opportunity_score"]["opportunity_score"]
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": code, "table_sections": ["congestion"]}),
+        text_reply(f"{code} scored {score}, with 1,234,567 invented passengers."),
+    )
+    app = ask(connect(run_app(network)), f"How does {code} score?")
+    assert app.session_state["history"][0][1].unverified_numbers == ["1,234,567"]
+    assert "do not match any tool result" not in page_text(app)
+    assert any("preliminary screening proxy" in item.value for item in app.info)
+    assert list(app.get("expander"))
+
+
+def sample_counts():
+    """Return two scored airports' departure samples. Not every scored airport is in the on-time data."""
+    congestion = {
+        row["airport"]: tools.get_airport_profile(row["airport"])["profile"]["operational_congestion"]
+        for row in tools.rank_opportunity_score([], 25)["ranked"]
+    }
+    return [(code, section["departures_in_sample"]) for code, section in congestion.items() if section][:2]
+
+
+def shown_sample_count(app):
+    frame = next(item.value for item in app.dataframe if "Departures in sample" in set(item.value.get("Measure", [])))
+    return frame.set_index("Measure").loc["Departures in sample"].iloc[0]
+
+
+@pytest.mark.parametrize("position", [0, 1])
+def test_valid_sample_count_has_no_warning_or_placeholder(run_app, position):
+    code, count = sample_counts()[position]
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": code, "table_sections": ["congestion"]}),
+        text_reply(f"{code} had {count:,} departures in the sample."),
+    )
+    app = ask(connect(run_app(network)), f"How congested is {code}?")
+    assert app.session_state["history"][0][1].unverified_numbers == []
+    assert not any("do not match any tool result" in item.value for item in app.warning)
+    text = "\n".join(item.value for item in app.markdown)
+    assert f"{count:,}" in text
+    assert presentation.UNVERIFIED_FIGURE not in text
+    assert shown_sample_count(app) == count
+
+
+@pytest.mark.parametrize("position", [0, 1])
+def test_fabricated_sample_count_is_hidden_and_the_table_keeps_the_tool_value(run_app, position):
+    code, count = sample_counts()[position]
+    fake = f"{count + 1:,}"
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": code, "table_sections": ["congestion"]}),
+        text_reply(f"{code} had {fake} departures in the sample.\n\nIts sample count was {fake}, or about {count:,}."),
+    )
+    app = ask(connect(run_app(network)), f"How congested is {code}?")
+    answer = app.session_state["history"][0][1]
+    assert answer.unverified_numbers == [fake]
+    # The replacement is for display. The stored answer stays as written, for the score and table checks.
+    assert answer.text.count(fake) == 2
+    text = "\n".join(item.value for item in app.markdown)
+    assert fake not in text
+    assert text.count(presentation.UNVERIFIED_FIGURE) == 2
+    assert f"or about {count:,}." in text
+    assert fake not in page_text(app)
+    assert "do not match any tool result" not in page_text(app)
+    assert shown_sample_count(app) == count
+
+
+def test_streamlit_and_command_line_show_the_same_replaced_text(run_app):
+    code, count = sample_counts()[0]
+    fake = f"{count + 1:,}"
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": code, "table_sections": ["congestion"]}),
+        text_reply(f"{code} had {fake} departures, or {count:,}.\n\nThe sample of {fake} is not {count:,}."),
+    )
+    app = ask(connect(run_app(network)), f"How congested is {code}?")
+    answer = app.session_state["history"][0][1]
+    shown = [item.value for item in app.markdown]
+    rendered = cli.render_answer(answer)
+    for part in presentation.split_answer(answer.text):
+        expected = presentation.hide_unverified_numbers(part, answer.unverified_numbers)
+        assert presentation.UNVERIFIED_FIGURE in expected and fake not in expected
+        assert expected in shown
+        assert expected in rendered
 
 
 def test_answer_without_a_tool_is_flagged(run_app):
@@ -1842,3 +2128,17 @@ def test_rejected_tool_input_is_presented_as_an_error():
     evidence = presentation.build_evidence(ToolCall("get_airport_profile", {"airport": "ZZZZ"}, {"error": "Not found"}, True))
     assert evidence.error == "Not found"
     assert evidence.tables == []
+
+
+def test_page_logs_render_and_question_timing_without_the_question(run_app, caplog):
+    network = FakeNetwork(text_reply("ANSWERTEXT."))
+    app = run_app(network)
+    with caplog.at_level("INFO", logger=gemini_agent.TIMING_LOGGER.name):
+        ask(app, "QUESTIONTEXT")
+    assert not app.error
+    assert [item.markdown[0].value for item in assistant_messages(app)] == ["ANSWERTEXT."]
+    logged = "\n".join(record.getMessage() for record in caplog.records if record.name == gemini_agent.TIMING_LOGGER.name)
+    assert "question_total" in logged and "page_render answers=1" in logged
+    assert "gemini_request model=gemini-3.5-flash-lite status=ok" in logged
+    for private in ("QUESTIONTEXT", "ANSWERTEXT", FAKE_KEY):
+        assert private not in logged
