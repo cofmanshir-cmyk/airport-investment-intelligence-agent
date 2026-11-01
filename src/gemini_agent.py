@@ -111,6 +111,12 @@ class GeminiAgent:
                 function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.AUTO)
             ),
         )
+        # The last call of a turn must answer from the tool results already returned.
+        self._final_config = self._config.model_copy(update={
+            "tool_config": types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.NONE)
+            ),
+        })
 
     def ask(self, question: str) -> Answer:
         turn_start = len(self.contents)
@@ -125,7 +131,7 @@ class GeminiAgent:
             del self._evidence[evidence_start:]
             raise
 
-    def _generate(self) -> types.GenerateContentResponse:
+    def _generate(self, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
         if self.calls_used >= self.call_limit:
             raise AgentError(
                 f"Stopped at the session limit of {self.call_limit} Gemini calls. "
@@ -134,14 +140,15 @@ class GeminiAgent:
         # Count before calling, because a failed request may still use allowance.
         self.calls_used += 1
         try:
-            return self.client.models.generate_content(model=self.model, contents=self.contents, config=self._config)
+            return self.client.models.generate_content(model=self.model, contents=self.contents, config=config)
         except httpx.TransportError as error:
             raise AgentError(NO_RESPONSE_MESSAGE) from error
 
     def _run_turn(self) -> Answer:
         calls: list[ToolCall] = []
-        for _ in range(MAX_TOOL_ROUNDS):
-            response = self._generate()
+        for round_number in range(1, MAX_TOOL_ROUNDS + 1):
+            final_round = round_number == MAX_TOOL_ROUNDS
+            response = self._generate(self._final_config if final_round else self._config)
             if not response.candidates or response.candidates[0].content is None:
                 feedback = response.prompt_feedback
                 reason = feedback.block_reason if feedback else "no content returned"
@@ -152,6 +159,10 @@ class GeminiAgent:
             self.contents.append(candidate.content)
             parts = candidate.content.parts or []
             function_calls = [part.function_call for part in parts if part.function_call]
+
+            if function_calls and final_round:
+                # Mode NONE should prevent this. Run nothing; ask() removes the failed turn.
+                break
 
             if not function_calls:
                 text = "\n".join(part.text for part in parts if part.text and not part.thought).strip()

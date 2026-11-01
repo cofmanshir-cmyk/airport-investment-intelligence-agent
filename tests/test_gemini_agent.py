@@ -261,6 +261,140 @@ def test_endless_tool_calls_stop_at_the_round_limit():
     assert len(network.bodies) == gemini_agent.MAX_TOOL_ROUNDS
 
 
+def calling_modes(network):
+    return [body["toolConfig"]["functionCallingConfig"]["mode"] for body in network.bodies]
+
+
+def test_third_call_uses_mode_none_after_two_automatic_calls():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 1}),
+        function_call("get_airport_profile", {"airport": "ILG", "table_sections": []}),
+        text_reply("Done."),
+    )
+    answer = make_agent(network).ask("Top airport, then its detail?")
+    assert answer.text == "Done."
+    assert calling_modes(network) == ["AUTO", "AUTO", "NONE"]
+    # Earlier calls and responses stay valid only while the declarations are still sent.
+    final_request = network.bodies[2]
+    assert {item["name"] for item in final_request["tools"][0]["functionDeclarations"]} == {
+        tool["name"] for tool in tools.TOOL_DEFINITIONS
+    }
+    assert final_request["systemInstruction"] == network.bodies[0]["systemInstruction"]
+    assert final_request["generationConfig"] == network.bodies[0]["generationConfig"]
+
+
+def test_answer_before_the_final_call_never_uses_mode_none():
+    network = FakeNetwork(function_call("get_airport_profile", {"airport": "SFO"}), text_reply("Done."))
+    make_agent(network).ask("Tell me about SFO")
+    assert calling_modes(network) == ["AUTO", "AUTO"]
+
+
+def test_each_question_gets_its_own_three_calls():
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "SFO"}),
+        function_call("get_airport_profile", {"airport": "LAX"}),
+        text_reply("First."),
+        function_call("get_airport_profile", {"airport": "SNA"}),
+        text_reply("Second."),
+    )
+    agent = make_agent(network)
+    agent.ask("One")
+    agent.ask("Two")
+    assert calling_modes(network) == ["AUTO", "AUTO", "NONE", "AUTO", "AUTO"]
+
+
+def test_results_from_every_round_reach_the_final_call_and_the_answer():
+    network = FakeNetwork(
+        {"candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"id": "a", "name": "rank_opportunity_score", "args": {"states": [], "top_n": 1}},
+             "thoughtSignature": SIGNATURE},
+            {"functionCall": {"id": "b", "name": "get_long_haul_share", "args": {"airport": "ANC", "threshold_miles": 3000}}},
+        ]}, "finishReason": "STOP"}]},
+        function_call("get_airport_profile", {"airport": "SFO", "table_sections": []}, call_id="c"),
+        text_reply("ILG scored 78.38, ANC is 2.6% long-haul, SFO grew 8.87% a year, and 1,234,567 is invented."),
+    )
+    agent = make_agent(network)
+    answer = agent.ask("Combine these")
+
+    assert [call.name for call in answer.tool_calls] == [
+        "rank_opportunity_score", "get_long_haul_share", "get_airport_profile",
+    ]
+    assert not any(call.is_error for call in answer.tool_calls)
+
+    final_contents = network.bodies[2]["contents"]
+    assert [item["role"] for item in final_contents] == ["user", "model", "user", "model", "user"]
+    assert final_contents[1]["parts"][0]["thoughtSignature"] == SIGNATURE
+    responses = {
+        part["functionResponse"]["id"]: part["functionResponse"]["response"]
+        for item in final_contents
+        for part in item["parts"]
+        if "functionResponse" in part
+    }
+    assert set(responses) == {"a", "b", "c"}
+    assert responses["a"]["ranked"][0]["opportunity_score"] == 78.38
+    assert responses["b"]["scopes"]["scheduled_passenger"]["share_pct"] == 2.6
+    assert responses["c"]["profile"]["demand_pressure_proxies"]["metrics"]["passenger_cagr_3y_pct"] == 8.87
+
+    # Each number is checked against the evidence from whichever round produced it.
+    assert answer.unverified_numbers == ["1,234,567"]
+    assert len(agent._evidence) == 4
+
+
+@pytest.mark.parametrize(
+    "final_parts",
+    [
+        [{"functionCall": {"id": "z", "name": "get_airport_profile", "args": {"airport": "SFO"}}}],
+        [
+            {"text": "An answer that also asks for a tool."},
+            {"functionCall": {"id": "z", "name": "get_airport_profile", "args": {"airport": "SFO"}}},
+        ],
+    ],
+    ids=["tool_call_only", "text_and_tool_call"],
+)
+def test_unexpected_final_tool_call_runs_nothing_and_leaves_history_clean(monkeypatch, final_parts):
+    executed = []
+    real_execute = tools.execute_tool
+
+    def spy(name, tool_input):
+        executed.append(name)
+        return real_execute(name, tool_input)
+
+    monkeypatch.setattr(tools, "execute_tool", spy)
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 1}),
+        function_call("get_long_haul_share", {"airport": "ANC", "threshold_miles": 3000}),
+        {"candidates": [{"content": {"role": "model", "parts": final_parts}, "finishReason": "STOP"}]},
+        text_reply("Next answer."),
+    )
+    agent = make_agent(network)
+
+    with pytest.raises(AgentError, match="tool rounds"):
+        agent.ask("Question")
+
+    assert executed == ["rank_opportunity_score", "get_long_haul_share"]
+    assert calling_modes(network) == ["AUTO", "AUTO", "NONE"]
+    assert agent.calls_used == 3
+    assert agent.contents == []
+    assert agent._evidence == []
+
+    assert agent.ask("Next question").text == "Next answer."
+    assert [item["role"] for item in network.bodies[3]["contents"]] == ["user"]
+    assert calling_modes(network)[3] == "AUTO"
+
+
+def test_empty_final_reply_is_reported_and_leaves_history_clean():
+    network = FakeNetwork(
+        function_call("get_airport_profile", {"airport": "SFO"}),
+        function_call("get_airport_profile", {"airport": "LAX"}),
+        {"candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "MALFORMED_FUNCTION_CALL"}]},
+    )
+    agent = make_agent(network)
+    with pytest.raises(AgentError, match="no text"):
+        agent.ask("Question")
+    assert agent.contents == []
+    assert agent._evidence == []
+
+
 def test_quota_error_makes_one_call_and_leaves_history_clean():
     network = FakeNetwork({"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}}, status=429)
     agent = make_agent(network)
