@@ -98,10 +98,10 @@ def test_request_declares_every_tool_and_sets_automatic_mode():
     assert "preliminary screening proxy" in instruction
     assert "Never calculate, approximate, adjust, rescale or reweight a score" in instruction
     assert "never a probability" in instruction
-    assert "35% of the score uses cargo-inclusive departure metrics" in instruction
+    assert "part of the score uses cargo-inclusive departure metrics" in instruction
     assert "absolute passenger growth favors larger airports" in instruction
     assert "Never call it a passenger load factor" in instruction
-    assert "120 to 180 words" in instruction
+    assert "80 to 120 words" in instruction
     assert "Never write a table" in instruction
     assert "Never add a passenger threshold" in instruction
     assert "terminal capacity" in instruction
@@ -243,16 +243,6 @@ def test_follow_up_keeps_history():
     assert [item["role"] for item in network.bodies[1]["contents"]] == ["user", "model", "user"]
 
 
-def test_session_limit_stops_before_making_a_call():
-    network = FakeNetwork(text_reply("One."), text_reply("Two."))
-    agent = make_agent(network, call_limit=1)
-    agent.ask("First")
-    with pytest.raises(AgentError, match="session limit"):
-        agent.ask("Second")
-    assert len(network.bodies) == 1
-    assert agent.calls_used == 1
-
-
 def test_endless_tool_calls_stop_at_the_round_limit():
     replies = [function_call("get_airport_profile", {"airport": "SFO"}) for _ in range(gemini_agent.MAX_TOOL_ROUNDS)]
     network = FakeNetwork(*replies)
@@ -373,7 +363,7 @@ def test_unexpected_final_tool_call_runs_nothing_and_leaves_history_clean(monkey
 
     assert executed == ["rank_opportunity_score", "get_long_haul_share"]
     assert calling_modes(network) == ["AUTO", "AUTO", "NONE"]
-    assert agent.calls_used == 3
+    assert len(network.bodies) == 3
     assert agent.contents == []
     assert agent._evidence == []
 
@@ -395,6 +385,193 @@ def test_empty_final_reply_is_reported_and_leaves_history_clean():
     assert agent._evidence == []
 
 
+def user_text(body):
+    return body["contents"][-1]["parts"][0]["text"]
+
+
+def shortlist(count=5):
+    return [row["airport"] for row in tools.rank_opportunity_score([], count)["ranked"]]
+
+
+def note_for(airports):
+    return f"(App note: the main set in the previous answer was {', '.join(airports)}.)"
+
+
+def test_follow_up_receives_the_exact_main_set_not_a_supporting_example():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 5}),
+        function_call("rank_airports", {"window_years": 3, "states": [], "top_n": 25, "min_enplanements": 100000}),
+        text_reply("Start with this shortlist. Another airport is a supporting example."),
+        text_reply("Which group do you mean?"),
+    )
+    agent = make_agent(network)
+    first = agent.ask("Where would you start?")
+    agent.ask("Which of those grew the most?")
+
+    supporting = {row["airport"] for row in first.tool_calls[1].result["ranked"]} - set(shortlist())
+    assert supporting
+    assert "App note" not in user_text(network.bodies[0])
+    sent = user_text(network.bodies[3])
+    assert sent.startswith("Which of those grew the most?")
+    assert note_for(shortlist()) in sent
+    assert not any(code in sent for code in supporting)
+
+
+def test_follow_up_note_leaves_tool_choice_and_evidence_alone():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 2}), text_reply("First."), text_reply("Second."),
+    )
+    agent = make_agent(network)
+    agent.ask("One")
+    agent.ask("Two")
+    body = network.bodies[2]
+    assert body["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
+    assert "allowedFunctionNames" not in body["toolConfig"]["functionCallingConfig"]
+    assert {item["name"] for item in body["tools"][0]["functionDeclarations"]} == {
+        tool["name"] for tool in tools.TOOL_DEFINITIONS
+    }
+    assert "Two" in agent._evidence
+    assert not any("App note" in item for item in agent._evidence)
+
+
+def test_clarifying_answer_without_a_tool_keeps_the_set():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("Shortlist."),
+        text_reply("Do you mean the shortlist?"),
+        text_reply("Done."),
+    )
+    agent = make_agent(network)
+    agent.ask("Start?")
+    agent.ask("Which one?")
+    agent.ask("The shortlist.")
+    assert note_for(shortlist(3)) in user_text(network.bodies[3])
+
+
+def test_a_new_comparison_replaces_the_set_and_earlier_notes_stay_in_history():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("Shortlist."),
+        function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": ["passenger_growth"]}), text_reply("Compared."),
+        text_reply("Done."),
+    )
+    agent = make_agent(network)
+    agent.ask("Start?")
+    agent.ask("What about LAX and SNA?")
+    agent.ask("Which of them?")
+    last = network.bodies[4]
+    assert note_for(["LAX", "SNA"]) in user_text(last)
+    assert note_for(shortlist(3)) in json.dumps(last["contents"])
+
+
+def test_failed_turn_does_not_change_the_set():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("Shortlist."),
+        function_call("compare_airports", {"airports": ["LAX", "SNA"], "table_sections": []}),
+        {"promptFeedback": {"blockReason": "SAFETY"}},
+        text_reply("Done."),
+    )
+    agent = make_agent(network)
+    agent.ask("Start?")
+    with pytest.raises(AgentError):
+        agent.ask("What about LAX and SNA?")
+    agent.ask("Which of them?")
+    assert note_for(shortlist(3)) in user_text(network.bodies[4])
+
+
+def test_rejected_tool_call_does_not_change_the_set():
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}), text_reply("Shortlist."),
+        function_call("get_airport_profile", {"airport": "ZZZZ", "table_sections": []}), text_reply("Not found."),
+        text_reply("Done."),
+    )
+    agent = make_agent(network)
+    agent.ask("Start?")
+    agent.ask("ZZZZ?")
+    agent.ask("Which of them?")
+    assert note_for(shortlist(3)) in user_text(network.bodies[4])
+
+
+def test_system_prompt_covers_follow_ups_tone_and_length():
+    instruction = make_agent(FakeNetwork())._config.system_instruction
+    assert "Never add, drop or swap an airport" in instruction
+    assert "supporting example" in instruction
+    assert "one short clarifying question" in instruction
+    assert "experienced analyst thinking out loud" in instruction
+    assert "No hype" in instruction
+    assert "what you would check next" in instruction
+    assert "40 to 80 words" in instruction
+    assert "passenger_growth when only passenger traffic or growth matters" in instruction
+
+
+def test_passenger_growth_section_is_offered_to_the_model():
+    declarations = gemini_agent.tool_declarations()[0].function_declarations
+    schemas = {tool.name: tool.parameters_json_schema for tool in declarations}
+    for name in ("compare_airports", "get_airport_profile"):
+        assert "passenger_growth" in schemas[name]["properties"]["table_sections"]["items"]["enum"]
+
+
+def test_main_table_line_is_removed_and_names_the_ranking_and_next_set():
+    growth_args = {"window_years": 3, "states": [], "top_n": 3, "min_enplanements": 100000}
+    network = FakeNetwork(
+        function_call("rank_opportunity_score", {"states": [], "top_n": 3}),
+        function_call("rank_airports", growth_args),
+        text_reply("Growth answer.\n\n[primary_table: rank_airports]"),
+        text_reply("Done."),
+    )
+    agent = make_agent(network)
+    answer = agent.ask("How fast?")
+    agent.ask("Which of them?")
+    assert answer.text == "Growth answer."
+    assert answer.primary_table == "rank_airports"
+    assert answer.unverified_numbers == []
+    expected = [row["airport"] for row in answer.tool_calls[1].result["ranked"]]
+    assert note_for(expected) in user_text(network.bodies[3])
+
+
+def test_reply_with_only_a_main_table_line_is_reported_as_no_text():
+    network = FakeNetwork(text_reply("[primary_table: rank_airports]"))
+    with pytest.raises(AgentError, match="no text"):
+        make_agent(network).ask("Question")
+
+
+def test_agent_has_no_session_call_limit():
+    questions = 12
+    network = FakeNetwork(*[text_reply("Answer.") for _ in range(questions)])
+    agent = make_agent(network)
+    for position in range(questions):
+        assert agent.ask(f"Question {position}").text == "Answer."
+    assert len(network.bodies) == questions
+    source = (config.ROOT / "src" / "gemini_agent.py").read_text()
+    assert "call_limit" not in source and "calls_used" not in source and "GEMINI_MAX_CALLS" not in source
+
+
+def test_per_question_tool_rounds_are_still_limited():
+    network = FakeNetwork(*[function_call("get_airport_profile", {"airport": "SFO"}) for _ in range(gemini_agent.MAX_TOOL_ROUNDS)])
+    with pytest.raises(AgentError, match="tool rounds"):
+        make_agent(network).ask("Question")
+    assert len(network.bodies) == gemini_agent.MAX_TOOL_ROUNDS
+
+
+def test_usable_models_lists_only_preferred_models_the_key_can_use():
+    network = FakeNetwork()
+    assert gemini_agent.usable_models(make_client(network)) == ["gemini-3.8-flash", "gemini-3.6-flash"]
+    assert network.bodies == []
+
+
+def test_usable_models_can_add_one_named_model_only_if_available():
+    client = make_client(FakeNetwork())
+    assert gemini_agent.usable_models(client, "gemini-9-flash") == ["gemini-3.8-flash", "gemini-3.6-flash"]
+
+
+def test_usable_models_explains_when_none_are_available():
+    def embeddings_only(request):
+        return httpx.Response(200, json={"models": [
+            {"name": "models/gemini-embedding", "supportedGenerationMethods": ["embedContent"]},
+        ]})
+
+    with pytest.raises(AgentError, match="No preferred Flash model"):
+        gemini_agent.usable_models(make_client(embeddings_only))
+
+
 def test_quota_error_makes_one_call_and_leaves_history_clean():
     network = FakeNetwork({"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}}, status=429)
     agent = make_agent(network)
@@ -402,7 +579,6 @@ def test_quota_error_makes_one_call_and_leaves_history_clean():
         agent.ask("Question")
     assert len(network.bodies) == 1
     assert agent.contents == []
-    assert agent.calls_used == 1
 
 
 def test_build_client_disables_retries():
@@ -427,7 +603,6 @@ def test_timeout_makes_one_call_and_leaves_history_clean():
         agent.ask("Question")
     assert len(requests) == 1
     assert agent.contents == []
-    assert agent.calls_used == 1
 
 
 def test_timeout_while_listing_models_is_reported():

@@ -28,7 +28,7 @@ def render_answer(answer: Answer) -> str:
     """Show the model's narrative with results tables built from tool output."""
     conclusion, rest = presentation.split_answer(answer.text)
     parts = [conclusion]
-    for table in presentation.main_tables(answer.tool_calls):
+    for table in presentation.main_tables(answer.tool_calls, answer.primary_table, answer.text):
         parts += [f"{table.title}\n{table.data.to_string(index=False)}", table.note]
     parts.append(rest)
     notice = presentation.small_base_notice(answer.tool_calls, answer.text)
@@ -87,12 +87,54 @@ def build_agent(provider: str) -> Agent | gemini_agent.GeminiAgent:
     return gemini_agent.GeminiAgent(client, model)
 
 
+def _quota_scope(error: gemini_errors.APIError) -> str | None:
+    """Read whether Google's quota details name a per-model limit. None means they do not say.
+
+    A limit is per-model only if every violation is, because any other would survive a model change.
+    """
+    body = error.details.get("error", error.details) if isinstance(error.details, dict) else {}
+    entries = body.get("details") if isinstance(body, dict) else None
+    violations = [
+        violation
+        for entry in entries or []
+        if isinstance(entry, dict)
+        for violation in entry.get("violations") or []
+        if isinstance(violation, dict) and ("quotaId" in violation or "quotaDimensions" in violation)
+    ]
+    if not violations:
+        return None
+    per_model = all(
+        "model" in (violation.get("quotaDimensions") or {}) or "PerModel" in str(violation.get("quotaId"))
+        for violation in violations
+    )
+    return "model" if per_model else "key"
+
+
 def _gemini_error(error: gemini_errors.APIError) -> str:
+    """Explain a Gemini error in plain words. Google's own text is never shown."""
     if error.code == 429:
-        return "Gemini quota or rate limit reached (429). Wait, or check your limits in Google AI Studio."
+        scope = _quota_scope(error)
+        if scope == "model":
+            return (
+                "The selected model may have reached its usage limit. "
+                "Try another available model, or wait a while and try again."
+            )
+        if scope == "key":
+            return (
+                "This API key has reached a usage limit that applies beyond the selected model, so switching models "
+                "may not help. Wait for the limit to reset, or check the key's quota in Google AI Studio."
+            )
+        return (
+            "Gemini's usage limit has been reached. Wait a while and try again. "
+            "Another model may help, unless the limit applies to the whole API key."
+        )
     if error.code in (401, 403) or "API_KEY_INVALID" in str(error):
-        return "Gemini rejected the API key or its permissions."
-    return _redact(f"Gemini API error {error.code}: {error.message}")
+        return "Gemini rejected the API key or its permissions. Switching models won't help, so check the server's configuration."
+    if error.code == 400 and error.status == "FAILED_PRECONDITION":
+        return "Gemini can't serve this API key in its current setup. Switching models won't help, so check the key's settings in Google AI Studio."
+    if error.code in (500, 502, 503, 504):
+        return "Gemini is temporarily overloaded or unavailable. Try again in a little while, or try another available model."
+    return "Gemini could not complete this request. Try again, or try another available model."
 
 
 def ask_and_print(agent, question: str) -> Answer | None:
@@ -122,8 +164,6 @@ def ask_and_print(agent, question: str) -> Answer | None:
         return None
     print(f"\n{render_answer(answer)}")
     print(render_evidence(answer))
-    if hasattr(agent, "calls_used"):
-        print(f"Gemini calls this session: {agent.calls_used} of {agent.call_limit}")
     return answer
 
 

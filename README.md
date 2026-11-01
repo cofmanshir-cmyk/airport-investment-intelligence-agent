@@ -31,10 +31,9 @@ use another model.
 ```
 
 The app asks for your Gemini API key the same way, confirms which Flash model the key can use,
-and then uses the same tools and safeguards. To protect a limited allowance, retries are off, each
-answer shows the calls used, and a session stops at 6 Gemini calls. A question usually takes 2
-calls. Set `GEMINI_MAX_CALLS` or `GEMINI_MODEL` to change the limit or the model. The counter
-covers one session only, so it can't track your total allowance.
+and then uses the same tools and safeguards. Automatic retries are off, and Google enforces its
+own quota; if it runs out, you see a clear message and nothing is resent. Set `GEMINI_MODEL` to
+choose a model.
 
 ### Use the web interface
 
@@ -43,12 +42,29 @@ covers one session only, so it can't track your total allowance.
 ```
 
 In Codespaces, open the **Ports** tab, then open port 8501 in your browser. Keep the port's
-visibility **Private**. The page uses Gemini; enter your key in the sidebar. It stays in memory
-for that browser session and is never saved. Example buttons only fill in the question box, and
-nothing is sent until you select **Ask**.
+visibility **Private**. The page uses Gemini, with the key configured on the server: set
+`GEMINI_API_KEY` as an environment variable or Codespaces secret, or add it to
+`.streamlit/secrets.toml`, which git ignores. The key never reaches the browser. The sidebar lets
+you choose among the models your key can use. The example cards on an empty chat send their
+question straight to the agent. **New Chat** clears the conversation.
+
+## Data
+
+- **Demand:** BTS T-100, 2015, 2022 and 2025
+- **Congestion:** BTS On-Time Performance, 2025
+- **Long-haul:** T-100 route file, Jan-Jul 2026, US carriers only
+- **Eligibility:** FAA CY2025 enplanements
+
+All calculations run in Python. The LLM chooses tools and explains their results. See
+[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) for details and limits. Each answer's **Explore the
+data & sources** section shows the sources, definitions and caveats behind that answer.
 
 ## Example questions
 
+- Which airports in New England are strong candidates for terminal expansion?
+- Compare LA and Santa Ana airport congestion levels.
+- What is the percentage of long haul flights out of Anchorage airport?
+- What is the unmet flight demand in SFO airport and why?
 - Which airports have the highest Airport Opportunity Score?
 - Which airports added the most passengers over 3 years?
 - Which airports with over 2 million departing passengers score highest?
@@ -75,8 +91,10 @@ as JSON, or `/quit` to exit.
 Answers lead with a short conclusion. Results tables are built in Python from tool output, and the
 LLM writes only the interpretation. Full evidence stays in a collapsed section.
 
-The number check flags figures to review. It can't prove an explanation is right, so compare
-important results with `/raw`.
+The number check is a limited safeguard, not full verification. It flags some figures that match
+no tool result, but it can't tell whether a figure belongs to the airport or measure it's attached
+to, and whole numbers often match something by chance. Compare important results with the evidence
+section, or with `/raw` on the command line.
 
 ## Provisional and unavailable
 
@@ -88,6 +106,9 @@ important results with `/raw`.
 - **Incomplete years:** shown as null, and an airport missing a scored metric gets no score.
 - **Service class:** passenger totals include all classes.
 - **Not measured:** passenger-only capacity, terminal capacity, unmet demand, profitability and returns.
+- **Source verification:** route, FAA and on-time data reconcile exactly with their raw files. The T-100
+  summary, which supplies the score's inputs, was fetched from an API with no raw copy kept, so its 2015
+  and 2022 values can't be checked against an original file.
 
 See [docs/METHODOLOGY.md](docs/METHODOLOGY.md) for the score and
 [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) for sources and limitations.

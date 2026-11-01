@@ -4,24 +4,31 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 
 import httpx
 from google import genai
 from google.genai import types
 
 from . import tools
-from .agent import MAX_TOKENS, SYSTEM_PROMPT, Answer, AgentError, ToolCall, find_unverified_numbers
+from .agent import (
+    MAX_TOKENS,
+    SYSTEM_PROMPT,
+    Answer,
+    AgentError,
+    ToolCall,
+    build_answer,
+    next_main_set,
+    with_main_set_note,
+)
 
 # Stable Flash models from Google's model list, newest first.
 PREFERRED_MODELS = ("gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
 MAX_TOOL_ROUNDS = 3
-DEFAULT_CALL_LIMIT = 6
 # The SDK waits forever without this, so a stalled request would never end.
 REQUEST_TIMEOUT_MS = 60_000
 NO_RESPONSE_MESSAGE = (
     "Gemini did not respond in time. Nothing was retried automatically. "
-    "You can try again or connect with another model."
+    "You can try again or try another available model."
 )
 
 
@@ -36,16 +43,35 @@ def build_client(api_key: str) -> genai.Client:
     )
 
 
-def select_model(client: genai.Client, requested: str | None = None) -> str:
-    """Pick a model the key can actually use. Listing models generates no content."""
+def _available_models(client: genai.Client) -> set[str]:
+    """List the models the key can generate with. Listing models generates no content."""
     try:
-        available = {
+        return {
             model.name.removeprefix("models/")
             for model in client.models.list()
             if "generateContent" in (model.supported_actions or [])
         }
     except httpx.TransportError as error:
         raise AgentError(NO_RESPONSE_MESSAGE) from error
+
+
+def _no_preferred_model(available: set[str]) -> AgentError:
+    flash = sorted(name for name in available if "flash" in name)
+    return AgentError(f"No preferred Flash model is available. Available Flash models: {flash}. Set GEMINI_MODEL.")
+
+
+def usable_models(client: genai.Client, extra: str | None = None) -> list[str]:
+    """List the preferred models this key can use, newest first, plus one named model if it is available."""
+    available = _available_models(client)
+    models = [model for model in dict.fromkeys((*PREFERRED_MODELS, extra)) if model in available]
+    if not models:
+        raise _no_preferred_model(available)
+    return models
+
+
+def select_model(client: genai.Client, requested: str | None = None) -> str:
+    """Pick a model the key can actually use."""
+    available = _available_models(client)
     if requested:
         if requested not in available:
             raise AgentError(f"Model {requested!r} is not available to this API key.")
@@ -53,8 +79,7 @@ def select_model(client: genai.Client, requested: str | None = None) -> str:
     for model in PREFERRED_MODELS:
         if model in available:
             return model
-    flash = sorted(name for name in available if "flash" in name)
-    raise AgentError(f"No preferred Flash model is available. Available Flash models: {flash}. Set GEMINI_MODEL.")
+    raise _no_preferred_model(available)
 
 
 def _gemini_schema(input_schema: dict) -> dict:
@@ -96,13 +121,12 @@ def _clean_args(args: dict | None) -> dict:
 class GeminiAgent:
     """Hold one conversation so follow-up questions keep their context."""
 
-    def __init__(self, client: genai.Client, model: str, call_limit: int | None = None):
+    def __init__(self, client: genai.Client, model: str):
         self.client = client
         self.model = model
-        self.call_limit = call_limit or int(os.environ.get("GEMINI_MAX_CALLS", DEFAULT_CALL_LIMIT))
-        self.calls_used = 0
         self.contents: list[types.Content] = []
         self._evidence: list[str] = []
+        self._main_set: list[str] = []
         self._config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             max_output_tokens=MAX_TOKENS,
@@ -118,27 +142,30 @@ class GeminiAgent:
             ),
         })
 
+    def reset(self) -> None:
+        """Start a new conversation with the same client."""
+        self.contents = []
+        self._evidence = []
+        self._main_set = []
+
     def ask(self, question: str) -> Answer:
         turn_start = len(self.contents)
         evidence_start = len(self._evidence)
-        self.contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+        self.contents.append(
+            types.Content(role="user", parts=[types.Part(text=with_main_set_note(question, self._main_set))])
+        )
         self._evidence.append(question)
         try:
-            return self._run_turn()
+            answer = self._run_turn()
         except Exception:
             # Remove the failed turn so the next question starts from valid history.
             del self.contents[turn_start:]
             del self._evidence[evidence_start:]
             raise
+        self._main_set = next_main_set(self._main_set, answer.tool_calls, answer.primary_table)
+        return answer
 
     def _generate(self, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
-        if self.calls_used >= self.call_limit:
-            raise AgentError(
-                f"Stopped at the session limit of {self.call_limit} Gemini calls. "
-                "Set GEMINI_MAX_CALLS to change it."
-            )
-        # Count before calling, because a failed request may still use allowance.
-        self.calls_used += 1
         try:
             return self.client.models.generate_content(model=self.model, contents=self.contents, config=config)
         except httpx.TransportError as error:
@@ -166,13 +193,10 @@ class GeminiAgent:
 
             if not function_calls:
                 text = "\n".join(part.text for part in parts if part.text and not part.thought).strip()
-                if not text:
+                answer = build_answer(text, calls, self._evidence)
+                if not answer.text:
                     raise AgentError(f"Gemini returned no text (finish reason: {candidate.finish_reason}).")
-                return Answer(
-                    text=text,
-                    tool_calls=calls,
-                    unverified_numbers=find_unverified_numbers(text, self._evidence),
-                )
+                return answer
 
             results = []
             for call in function_calls:

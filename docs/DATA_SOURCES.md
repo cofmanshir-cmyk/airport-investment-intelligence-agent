@@ -48,8 +48,9 @@ outbound plus inbound exactly. Airport and national totals must not be mixed in 
 national totals include inbound traffic. The API publishes field names but no column definitions, so this
 evidence comes from these checks.
 
-**Cross-check.** For the 142 hub airports matched to the FAA file, 2025 T-100
-passengers are 0.995–1.033 times FAA enplanements, with a median of 1.005.
+**Cross-check.** For the 144 hub airports matched to the FAA file, 2025 T-100
+passengers are 0.995–1.033 times FAA enplanements, with a median of 1.004. For 2024 the range is
+0.989–1.030, also with a median of 1.004.
 
 ## Limitations
 
@@ -87,15 +88,36 @@ passengers are 0.995–1.033 times FAA enplanements, with a median of 1.005.
 - 2022, the 3-year base, was still a recovery year: national airport-level departures
   were 8.97M, against 10.23M in 2019 and 9.95M in 2025.
 
+The summary was fetched from the API, and no raw copy or hash was kept. It can't be reconciled with
+an original file, including the 2015 and 2022 inputs to the score. Its internal totals reconcile
+exactly with the national series, but that comes from the same provider, so it isn't independent
+proof. FAA enplanements give an independent check only for 2024 and 2025, and the route file only for
+January–July 2026. The route, FAA and on-time Parquet files have each been reconciled exactly with
+their raw files.
+
 **FAA file**
 
-- 36 of 516 airports do not match the summary by code. They include IWA and GPI, which
-  are small hubs. Those airports have no history in this snapshot.
+- 35 of 516 FAA codes do not appear in the summary. `FAA_TO_T100_CODES` in `src/config.py` maps 34
+  codes, including IWA and GPI, which are small hubs with full history and scores. One of the 34 is
+  A61, which the summary uses for a different airport. RVR and AFE stay unmatched, have no history in
+  this snapshot, and fall below the eligibility threshold. The mapping comes from OurAirports, an
+  unofficial source; each mapped pair was checked for overlapping airport names, not against an
+  official list.
+- T-100 passengers and FAA enplanements differ unusually at three eligible airports: KTN (1.57 times
+  FAA in 2025, 1.55 in 2024), GRK (0.81 and 0.79) and JNU (1.20 in 2025). **The cause has not been
+  established.** Scores use T-100, and eligibility uses FAA, so GRK qualifies with 91,854 T-100
+  passengers in 2025.
 
 **On-time data**
 
 - It covers reporting carriers on domestic flights only, so international departures
   and most cargo are absent.
+- Departures in the sample are scheduled flights, including cancelled ones, while T-100 counts
+  flights performed. The coverage share can therefore slightly overstate coverage: LAX is 91.1%,
+  or 90.5% counting flown flights only, and five eligible airports exceed 100%.
+- Delay minutes per arrival divide by scheduled arrivals, including cancelled flights: LAX NAS delay
+  is 1.96 minutes, or 1.97 per completed arrival. Delay rates and average taxi-out use only flights
+  with a reported value.
 - Delay-cause minutes are reported on arriving flights and may originate elsewhere in
   the network, so they are grouped by destination and kept apart from departure measures.
 - The source also omits details such as slot limits, curfews and runway layouts.

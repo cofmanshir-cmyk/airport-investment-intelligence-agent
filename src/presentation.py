@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import calendar
 import re
 from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
-from . import scoring
-from .agent import ToolCall
+from . import scoring, tools
+from .agent import RANKING_TOOLS, ToolCall, find_unverified_numbers, primary_ranking
 
 PROVISIONAL_PREFIX = "PROVISIONAL"
 SMALL_BASE_PREFIX = "Small base"
@@ -42,10 +43,10 @@ LABELS = {
     "cancelled_departures_pct": "Cancelled departures (%)",
     "average_taxi_out_min": "Average taxi-out (min)",
     "arrivals_delayed_15_plus_min_pct": "Arrivals delayed 15+ min (%)",
-    "nas_delay_min_per_arrival": "NAS delay (min per arrival)",
-    "weather_delay_min_per_arrival": "Weather delay (min per arrival)",
-    "carrier_delay_min_per_arrival": "Carrier delay (min per arrival)",
-    "late_aircraft_delay_min_per_arrival": "Late-aircraft delay (min per arrival)",
+    "nas_delay_min_per_arrival": "NAS delay (min per scheduled arrival)",
+    "weather_delay_min_per_arrival": "Weather delay (min per scheduled arrival)",
+    "carrier_delay_min_per_arrival": "Carrier delay (min per scheduled arrival)",
+    "late_aircraft_delay_min_per_arrival": "Late-aircraft delay (min per scheduled arrival)",
 }
 
 RANK_COLUMNS = {
@@ -59,6 +60,7 @@ RANK_COLUMNS = {
 
 SCORE_LABEL = "Score (points out of 100)"
 SCORE_TABLE_TITLE = "Airport Opportunity Score"
+DEMAND_TABLE_TITLE = "Demand-pressure proxies"
 SCORE_PROXY_NOTE = "Preliminary screening proxy, not an investment recommendation."
 POSITION_LABEL = "Position in this list"
 
@@ -170,7 +172,7 @@ def _airport_sections(profiles: dict[str, dict]) -> dict[str, list[Table]]:
     sections = {
         "score": _score_tables(profiles),
         "demand": [_section_table(
-            "Demand-pressure proxies",
+            DEMAND_TABLE_TITLE,
             {
                 code: {
                     **profile["demand_pressure_proxies"]["metrics"],
@@ -276,7 +278,7 @@ def _opportunity_evidence(result: dict) -> tuple[list[Table], list[str]]:
         tables.append(Table(
             SCORE_TABLE_TITLE,
             pd.DataFrame(rows).reindex(columns=list(columns)).rename(columns=columns),
-            _filter_note(result["filters"]),
+            f"{SCORE_PROXY_NOTE} {_filter_note(result['filters'])}",
         ))
         points = {row["airport"]: row["score_points"] for row in result["ranked"]}
         tables.append(_section_table("Score points by metric", points, "Points = weight x normalized value / 100."))
@@ -321,17 +323,121 @@ def split_answer(text: str) -> tuple[str, str]:
     return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
 
 
-def main_tables(calls: list[ToolCall]) -> list[Table]:
-    """Choose the results table for each tool, from its own output."""
+def _passenger_growth_table(profiles: dict[str, dict]) -> Table:
+    """Show only the passenger growth measures. Evidence keeps every demand metric."""
+    def measures(profile: dict) -> dict:
+        demand = profile["demand_pressure_proxies"]
+        metrics, inputs = demand["metrics"], demand["annual_inputs"]
+        return {
+            "Passengers 2022": _display(inputs["2022"].get("passengers")),
+            "Passengers 2025": _display(inputs["2025"].get("passengers")),
+            "Absolute Passenger Growth 3Y": _display(metrics["absolute_passenger_growth_3y"]),
+            "Absolute Passenger Growth 10Y": _display(demand["supplementary_not_scored"]["absolute_passenger_growth_10y"]),
+            "Passenger CAGR 3Y (%)": _display(metrics["passenger_cagr_3y_pct"], "{:.2f}"),
+            "Passenger CAGR 10Y (%)": _display(metrics["passenger_cagr_10y_pct"], "{:.2f}"),
+        }
+
+    return _section_table(
+        "Passenger growth",
+        {code: measures(profile) for code, profile in profiles.items()},
+        "Departing passengers in full calendar years; 10Y runs from 2015. n/a means a required year is incomplete. "
+        "Absolute growth tends to favor larger airports.",
+    )
+
+
+def _named_at(code: str, profile: dict, text: str) -> int | None:
+    """Find where a text first names an airport, by its code or the city in its tool result."""
+    matches = [re.search(rf"\b{re.escape(code)}\b", text)]
+    if profile.get("city"):
+        matches.append(re.search(rf"\b{re.escape(profile['city'])}\b", text, re.IGNORECASE))
+    positions = [match.start() for match in matches if match]
+    return min(positions) if positions else None
+
+
+def _featured_airport(calls: list[ToolCall], narrative: str, preferred: str | None) -> str | None:
+    """Pick the looked-up airport the answer features.
+
+    The model's own line decides, because the first airport named may only be a contrast. An airport
+    it names but did not look up gets no table. Without the line, the first one named is the best
+    available guess, and several unnamed look-ups feature none.
+    """
+    profiles = {}
+    for call in calls:
+        if call.name == "get_airport_profile" and not call.is_error:
+            profiles.setdefault(call.result["profile"]["airport"], call.result["profile"])
+    if preferred and preferred not in RANKING_TOOLS:
+        return preferred if preferred in profiles else None
+    for text in split_answer(narrative):
+        positions = {code: _named_at(code, profile, text) for code, profile in profiles.items()}
+        named = {code: position for code, position in positions.items() if position is not None}
+        if named:
+            return min(named, key=named.get)
+    return next(iter(profiles)) if len(profiles) == 1 else None
+
+
+def _one_compact_table(tables: list[Table]) -> list[Table]:
+    """Keep one table, passing over the long demand table when a shorter one was also requested."""
+    return next(([table] for table in tables if table.title != DEMAND_TABLE_TITLE), tables[:1])
+
+
+def _period_label(period: dict) -> str:
+    """Turn a period such as 2026-01 to 2026-07 into January-July 2026."""
+    first_year, first_month = period["first"].split("-")
+    last_year, last_month = period["last"].split("-")
+    first, last = calendar.month_name[int(first_month)], calendar.month_name[int(last_month)]
+    if first_year != last_year:
+        return f"{first} {first_year} to {last} {last_year}"
+    return f"{first} {first_year}" if first == last else f"{first}\u2013{last} {first_year}"
+
+
+def _long_haul_main_table(result: dict) -> Table:
+    """Keep each share beside the flights it describes, with the limits that apply to it."""
+    rows = [
+        {
+            "Flights": SCOPE_LABELS[scope],
+            "Departures": int(result["scopes"][scope]["departures"]),
+            "Long-haul departures": int(result["scopes"][scope]["long_haul_departures"]),
+            "Long-haul share (%)": result["scopes"][scope]["share_pct"],
+        }
+        for scope in ("all", "passenger", "freighter")
+    ]
+    note = (
+        f"Long-haul means at least {result['threshold_miles']:,g} statute miles, an assumption with no single standard "
+        f"definition. {_period_label(result['period'])}, US carriers only."
+    )
+    coverage = result.get("coverage") or {}
+    if coverage.get("available"):
+        bounds = coverage["all_flights_share_bounds_pct"]
+        note += (
+            f" This file covers {coverage['departure_coverage_pct']:g}% of {result['airport']}'s departures, so the share of "
+            f"all flights could be {bounds['low']:g}% to {bounds['high']:g}%."
+        )
+    else:
+        note += " Coverage against all carriers could not be calculated."
+    return Table(f"{result['airport']} long-haul share", pd.DataFrame(rows), note)
+
+
+def main_tables(calls: list[ToolCall], preferred: str | None = None, narrative: str | None = None) -> list[Table]:
+    """Choose the results tables shown with an answer. The evidence section always keeps everything.
+
+    Different rankings would compete, so only the primary kind is shown. With the narrative, airport
+    look-ups must also match what the answer discusses: a table for the featured airport only, and
+    none when a ranking leads. A comparison that names just one of its airports keeps one table.
+    """
+    primary = primary_ranking(calls, preferred)
+    featured = None if narrative is None else _featured_airport(calls, narrative, preferred)
+    shown_airports = set()
     tables = []
     for call in calls:
-        if call.is_error:
+        if call.is_error or (call.name in RANKING_TOOLS and (primary is None or call.name != primary.name)):
             continue
         result = call.result
         if call.name == "rank_opportunity_score":
             tables += _opportunity_evidence(result)[0][:1] if result["ranked"] else []
         elif call.name == "rank_airports":
             tables += _rank_evidence(result)[0][:1] if result["ranked"] else []
+        elif call.name == "get_long_haul_share":
+            tables.append(_long_haul_main_table(result))
         elif call.name in ("compare_airports", "get_airport_profile"):
             profiles = result["airports"] if call.name == "compare_airports" else {result["profile"]["airport"]: result["profile"]}
             sections = _airport_sections(profiles)
@@ -339,8 +445,25 @@ def main_tables(calls: list[ToolCall]) -> list[Table]:
             chosen = result.get("table_sections")
             if chosen is None:
                 chosen = list(sections) if call.name == "compare_airports" else []
-            tables += [sections[name][0] for name in chosen if sections[name]]
+            sections["passenger_growth"] = [_passenger_growth_table(profiles)]
+            requested = [sections[name][0] for name in chosen if sections[name]]
+            if narrative is None:
+                tables += requested
+            elif call.name == "get_airport_profile":
+                code = result["profile"]["airport"]
+                if primary is None and code == featured and code not in shown_airports:
+                    shown_airports.add(code)
+                    tables += _one_compact_table(requested)
+            else:
+                named = [code for code, profile in profiles.items() if _named_at(code, profile, narrative) is not None]
+                focused = preferred in profiles or len(named) == 1
+                tables += _one_compact_table(requested) if focused else requested
     return tables
+
+
+def with_short_ranks(tables: list[Table]) -> list[Table]:
+    """Show "#1" rather than "#1 of 229". The evidence tables keep the full form."""
+    return [replace(table, data=table.data.replace(r"^(#\d+) of \d+$", r"\1", regex=True)) for table in tables]
 
 
 def _returned_scores(calls: list[ToolCall]) -> list[tuple[float, int, int]]:
@@ -373,7 +496,7 @@ def _states_returned_score(score: float, rank: int, total: int, narrative: str) 
 
 
 def reports_opportunity_score(
-    calls: list[ToolCall], narrative: str, earlier_calls: list[ToolCall] | None = None
+    calls: list[ToolCall], narrative: str, earlier_calls: list[ToolCall] | None = None, preferred: str | None = None
 ) -> bool:
     """Decide from tool results and displayed values whether this answer reports the score.
 
@@ -381,9 +504,10 @@ def reports_opportunity_score(
     enough. Earlier results count because a follow-up can restate a score without a new tool.
     """
     succeeded = [call for call in calls if not call.is_error]
-    if any(call.name == "rank_opportunity_score" for call in succeeded):
+    primary = primary_ranking(succeeded, preferred)
+    if primary is None and any(call.name == "rank_opportunity_score" for call in succeeded):
         return True
-    if any(table.title == SCORE_TABLE_TITLE for table in main_tables(succeeded)):
+    if any(table.title == SCORE_TABLE_TITLE for table in main_tables(succeeded, preferred, narrative)):
         return True
     return any(
         _states_returned_score(score, rank, total, narrative)
@@ -485,6 +609,131 @@ def build_evidence(call: ToolCall) -> ToolEvidence:
     evidence.provisional = [caveat for caveat in caveats if caveat.startswith(PROVISIONAL_PREFIX)]
     evidence.caveats = [caveat for caveat in caveats if not caveat.startswith(PROVISIONAL_PREFIX)]
     return evidence
+
+
+_GROWTH_DEFINITIONS = (
+    "passenger_cagr_3y_pct", "passenger_cagr_10y_pct", "absolute_passenger_growth_3y", "absolute_passenger_growth_10y",
+)
+_SECTION_TITLES = {
+    "score": (SCORE_TABLE_TITLE, "Score points by metric"),
+    "demand": (DEMAND_TABLE_TITLE,),
+    "congestion": ("Operational congestion",),
+    "cargo": ("Cargo context, not scored",),
+}
+_SECTION_DEFINITIONS = {
+    "score": (*scoring.WEIGHTS, "opportunity_score", "national_rank"),
+    "demand": (*scoring.WEIGHTS, "absolute_passenger_growth_10y"),
+    "passenger_growth": _GROWTH_DEFINITIONS,
+}
+# Describes the ratios in analytics.congestion_metrics, which the tool returns without definitions.
+CONGESTION_DEFINITIONS = {
+    "departures_in_sample": "Scheduled domestic departures by reporting carriers in the on-time data, including cancelled flights",
+    "share_of_t100_domestic_departures_pct": (
+        "Departures in sample / T-100 domestic departures performed, which shows the data's coverage. "
+        "The sample includes cancelled flights, so this can slightly overstate coverage and can exceed 100%"
+    ),
+    "departures_delayed_15_plus_min_pct": "Departures delayed 15+ minutes / departures with a delay status, percent",
+    "cancelled_departures_pct": "Cancelled departures / departures in sample, percent",
+    "average_taxi_out_min": "Total taxi-out minutes / departures with a taxi-out time",
+    "arrivals_delayed_15_plus_min_pct": "Arrivals delayed 15+ minutes / arrivals with a delay status, percent",
+    "nas_delay_min_per_arrival": "National Aviation System delay minutes / scheduled arrivals, including cancelled flights",
+    "weather_delay_min_per_arrival": "Weather delay minutes / scheduled arrivals, including cancelled flights",
+    "carrier_delay_min_per_arrival": "Carrier delay minutes / scheduled arrivals, including cancelled flights",
+    "late_aircraft_delay_min_per_arrival": "Late-aircraft delay minutes / scheduled arrivals, including cancelled flights",
+}
+_GROWTH_CAVEATS = (tools.SIZE_BIAS, tools.BASE_2022, tools.PASSENGER_COUNT, tools.CONNECTING, tools.INCOMPLETE_YEARS)
+_SECTION_CAVEATS = {
+    "score": (
+        *_GROWTH_CAVEATS, tools.CARGO_INCLUSIVE, tools.LOAD_FACTOR, tools.METRIC_OVERLAP, tools.THRESHOLD,
+    ),
+    "demand": (*_GROWTH_CAVEATS, tools.LOAD_FACTOR),
+    "passenger_growth": _GROWTH_CAVEATS,
+    "congestion": (tools.CONGESTION_SCOPE,),
+}
+_SECTION_SOURCES = {
+    "score": ("t100_summary", "faa", "t100_routes"),
+    "demand": ("t100_summary",),
+    "passenger_growth": ("t100_summary",),
+    "congestion": ("ontime", "t100_summary"),
+    "cargo": ("t100_summary",),
+}
+# Cheapest explanation first, so a growth figure never brings in the score table.
+_SECTIONS_BY_SPECIFICITY = ("congestion", "cargo", "passenger_growth", "demand", "score")
+
+
+def _table_text(tables: list[Table]) -> str:
+    return "\n".join(table.data.to_csv(index=False) for table in tables)
+
+
+def _answer_sections(call: ToolCall, narrative: str) -> list[str]:
+    """List the sections behind an answer: those requested, plus any whose numbers the answer cites."""
+    result = call.result
+    profiles = result["airports"] if call.name == "compare_airports" else {result["profile"]["airport"]: result["profile"]}
+    sections = _airport_sections(profiles)
+    default = list(sections) if call.name == "compare_airports" else []
+    sections["passenger_growth"] = [_passenger_growth_table(profiles)]
+    requested = result.get("table_sections")
+    chosen = list(default if requested is None else requested)
+    texts = [_table_text(sections[name]) for name in chosen]
+    uncited = find_unverified_numbers(narrative, texts)
+    for name in _SECTIONS_BY_SPECIFICITY:
+        if name not in chosen and uncited:
+            remaining = find_unverified_numbers(narrative, [*texts, _table_text(sections[name])])
+            if len(remaining) < len(uncited):
+                chosen.append(name)
+                texts.append(_table_text(sections[name]))
+                uncited = remaining
+    return chosen
+
+
+def focused_evidence(
+    evidence: ToolEvidence, call: ToolCall, calls: list[ToolCall], narrative: str, preferred: str | None = None
+) -> ToolEvidence:
+    """Limit what a person sees to what this answer used. The complete tool result stays in evidence.raw."""
+    if call.is_error:
+        return evidence
+    if call.name == "rank_opportunity_score":
+        primary = primary_ranking(calls, preferred)
+        led_by_another = primary is not None and primary.name != call.name
+        if led_by_another and len(find_unverified_numbers(narrative, [_table_text(evidence.tables)])) == len(
+            find_unverified_numbers(narrative, [])
+        ):
+            return replace(evidence, tables=[], warnings=[], definitions={}, provisional=[], caveats=[])
+        return evidence
+    if call.name not in ("compare_airports", "get_airport_profile"):
+        return evidence
+
+    chosen = _answer_sections(call, narrative)
+    result = call.result
+    profiles = result["airports"] if call.name == "compare_airports" else {result["profile"]["airport"]: result["profile"]}
+    titles = {title for name in chosen for title in _SECTION_TITLES.get(name, ())}
+    tables = [table for table in evidence.tables if table.title in titles]
+    if "passenger_growth" in chosen:
+        tables.insert(0, _passenger_growth_table(profiles))
+    if {"demand", "passenger_growth"} & set(chosen):
+        tables += [table for table in evidence.tables if table.title.endswith(" annual inputs")]
+
+    definitions = {
+        key: value
+        for key, value in evidence.definitions.items()
+        if any(key in _SECTION_DEFINITIONS.get(name, ()) for name in chosen)
+    }
+    if "congestion" in chosen:
+        definitions.update(CONGESTION_DEFINITIONS)
+    caveats = {caveat for name in chosen for caveat in _SECTION_CAVEATS.get(name, ())}
+    sources = {tools.SOURCES[key] for name in chosen for key in _SECTION_SOURCES[name]}
+    period_names = {"congestion" if name == "congestion" else "demand" for name in chosen if name != "cargo"}
+    # An answer that used no table keeps its sources and periods, because they still describe the tool call.
+    return replace(
+        evidence,
+        tables=tables,
+        periods=[result["periods"][name] for name in result["periods"] if name in period_names] if chosen else evidence.periods,
+        warnings=evidence.warnings if {"score", "demand", "passenger_growth"} & set(chosen) else [],
+        definitions=definitions,
+        sources=[source for source in evidence.sources if source in sources] if chosen else evidence.sources,
+        provisional=[caveat for caveat in evidence.provisional if caveat in caveats],
+        caveats=[caveat for caveat in evidence.caveats if caveat in caveats],
+    )
 
 
 def escape_markdown(text: str) -> str:

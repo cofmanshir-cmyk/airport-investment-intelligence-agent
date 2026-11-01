@@ -132,14 +132,22 @@ def year_inputs(annual: pd.DataFrame, airport: str) -> dict:
 
 
 def congestion_metrics(ontime: pd.DataFrame, annual: pd.DataFrame, airport: str) -> dict | None:
-    """Calculate operational congestion for a year of reporting-carrier flights."""
+    """Report operational congestion for display, rounded to one decimal."""
+    values = congestion_values(ontime, annual, airport)
+    if values is None:
+        return None
+    return {name: round(value, 1) if isinstance(value, float) else value for name, value in values.items()}
+
+
+def congestion_values(ontime: pd.DataFrame, annual: pd.DataFrame, airport: str) -> dict | None:
+    """Calculate operational congestion for a year of reporting-carrier flights, unrounded."""
     rows = ontime[ontime["airport"] == airport]
     if rows.empty:
         return None
     totals = rows[[column for column in rows.columns if column not in ("airport", "year", "month")]].sum()
 
     def ratio(top, bottom, scale=1.0):
-        return round(float(scale * totals[top] / totals[bottom]), 1) if totals[bottom] > 0 else None
+        return float(scale * totals[top] / totals[bottom]) if totals[bottom] > 0 else None
 
     t100_departures = None
     year = int(rows["year"].iloc[0])
@@ -150,7 +158,7 @@ def congestion_metrics(ontime: pd.DataFrame, annual: pd.DataFrame, airport: str)
         "months": int(rows["month"].nunique()),
         "departures_in_sample": int(totals["departures"]),
         "share_of_t100_domestic_departures_pct": (
-            round(100 * float(totals["departures"]) / t100_departures, 1) if t100_departures else None
+            100 * float(totals["departures"]) / t100_departures if t100_departures else None
         ),
         "departures_delayed_15_plus_min_pct": ratio("dep_del15", "dep_del15_reported", 100),
         "cancelled_departures_pct": ratio("cancelled", "departures", 100),

@@ -12,7 +12,7 @@ from . import analytics, config, scoring
 MAX_TOP_N = 25
 MAX_COMPARE = 6
 PASSENGER_COMPARISONS = ("at_least", "over")
-TABLE_SECTIONS = ("score", "demand", "congestion", "cargo")
+TABLE_SECTIONS = ("score", "passenger_growth", "demand", "congestion", "cargo")
 
 SOURCES = {
     "t100_summary": "BTS T-100 Segment Summary By Origin Airport (r495-tyji), all carriers",
@@ -62,8 +62,8 @@ THRESHOLD = (
 )
 CONGESTION_SCOPE = (
     "Operational congestion comes from reporting carriers on domestic flights only, so international "
-    "and most cargo flights are absent. Delay-cause minutes attach to arriving flights and may "
-    "originate elsewhere in the network."
+    "and most cargo flights are absent. Departure counts include cancelled flights, and delay minutes are "
+    "per scheduled arrival. Delay-cause minutes attach to arriving flights and may originate elsewhere in the network."
 )
 
 METRIC_DEFINITIONS = {
@@ -298,21 +298,17 @@ def compare_airports(airports: list[str], table_sections: list[str] | None = Non
         raise ToolInputError("Airport codes must be different.")
     profiles = {code: _profile(code) for code in codes}
 
-    def differences(section, *path):
-        """Calculate each measure's difference from the first airport."""
-        def values(code):
-            node = profiles[code][section]
-            for key in path:
-                node = None if node is None else node.get(key)
-            return node or {}
-
-        first = values(codes[0])
+    def differences(values, decimals):
+        """Calculate each measure's difference from the first airport, rounding only the result."""
+        first = values(codes[0]) or {}
         table = {}
         for code in codes[1:]:
+            other = values(code) or {}
             table[f"{code}_minus_{codes[0]}"] = {
-                key: round(values(code)[key] - value, 2)
+                # Adding zero turns a rounded -0.0 into 0.0.
+                key: round(other[key] - value, decimals) + 0
                 for key, value in first.items()
-                if isinstance(value, (int, float)) and isinstance(values(code).get(key), (int, float))
+                if isinstance(value, (int, float)) and isinstance(other.get(key), (int, float))
                 and key not in ("year", "months")
             }
         return table
@@ -332,11 +328,14 @@ def compare_airports(airports: list[str], table_sections: list[str] | None = Non
         "airports": profiles,
         "differences_from_first_airport": {
             "opportunity_score": score_differences(),
-            "demand_pressure_proxies": differences("demand_pressure_proxies", "metrics"),
-            "operational_congestion": differences("operational_congestion"),
+            "demand_pressure_proxies": differences(lambda code: analytics.metric_values(_annual(), code), 2),
+            "operational_congestion": differences(
+                lambda code: analytics.congestion_values(_load("ontime_airport_month"), _annual(), code), 1
+            ),
         },
         "interpretation_note": (
-            "Operational congestion and demand-pressure proxies are different concepts and must not be merged."
+            "Operational congestion and demand-pressure proxies are different concepts and must not be merged. "
+            "Differences are calculated before rounding, so they can differ slightly from subtracting the rounded values."
         ),
         "peer_group": PEER_GROUP,
         "definitions": PROFILE_DEFINITIONS,
@@ -526,7 +525,8 @@ TOOL_DEFINITIONS = [
         "description": (
             "Rank US airports by the Airport Opportunity Score, a broad screening proxy from 11 weighted metrics, in "
             "points out of 100. Scores use a fixed national peer group, so state and passenger filters only limit which "
-            "airports are shown. Pass a list of states for a region; New England is CT, MA, ME, NH, RI, VT."
+            "airports are shown. Pass a list of states for a region; New England is CT, MA, ME, NH, RI, VT. Use this first "
+            "when the user asks which airports look most promising overall, including for investment or expansion."
         ),
         "strict": True,
         "input_schema": _schema({
@@ -541,7 +541,8 @@ TOOL_DEFINITIONS = [
         "description": (
             "Rank US airports on one passenger growth metric, either CAGR or absolute growth. Use for fastest-growing "
             "airports, the most added passengers, or passenger growth in a state or region. Pass a list of states for "
-            "a region; New England is CT, MA, ME, NH, RI, VT. This is not the Airport Opportunity Score."
+            "a region; New England is CT, MA, ME, NH, RI, VT. This is not the Airport Opportunity Score. Use this when the "
+            "question is about growth itself, not for overall investment or expansion screening."
         ),
         "strict": True,
         "input_schema": _schema({

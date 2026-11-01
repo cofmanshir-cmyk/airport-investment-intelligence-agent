@@ -7,27 +7,28 @@ import os
 
 import streamlit as st
 from google.genai import errors as gemini_errors
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from src import cli, gemini_agent, presentation, tools
 from src.agent import AgentError, Answer
 
 AUTOMATIC_MODEL = "Automatic (newest available)"
-ALL_AIRPORTS = "All eligible airports"
-PASSENGER_PRESETS = {
-    ALL_AIRPORTS: 0,
-    "At least 500,000": 500_000,
-    "At least 1 million": 1_000_000,
-    "At least 5 million": 5_000_000,
-    "At least 10 million": 10_000_000,
-}
 
-EXAMPLES = {
-    "Airport Opportunity Score": "Which airports have the highest Airport Opportunity Score?",
-    "Airport ranking": "Rank New England airports by 3-year passenger growth.",
-    "Airport comparison": "Compare LAX and SNA congestion.",
-    "Airport profile": "Give me a profile of SFO.",
-    "Long-haul analysis": "What percentage of flights departing ANC are long-haul?",
-}
+EXAMPLES = [
+    "Which airports in New England are strong candidates for terminal expansion?",
+    "Compare LA and Santa Ana airport congestion levels.",
+    "What is the percentage of long haul flights out of Anchorage airport?",
+    "What is the unmet flight demand in SFO airport and why?",
+]
+MISSING_KEY_MESSAGE = (
+    "Gemini is not configured yet. Set the `GEMINI_API_KEY` environment variable, or add it to "
+    "`.streamlit/secrets.toml`, then reload this page."
+)
+# Buttons have no height option, so this keeps the example cards the same size.
+EXAMPLE_CARD_STYLE = """<style>
+.st-key-example-cards button { min-height: 4.5rem; }
+.st-key-example-cards button p { text-align: left; }
+</style>"""
 
 st.set_page_config(page_title="Airport Investment Intelligence", page_icon="✈️", layout="wide")
 
@@ -35,60 +36,77 @@ state = st.session_state
 state.setdefault("agent", None)
 state.setdefault("history", [])
 state.setdefault("error", None)
+state.setdefault("models", [])
+state.setdefault("connection_error", None)
+state.setdefault("failed_question", None)
+
+
+def server_api_key() -> str:
+    """Read the key from the server's environment or Streamlit secrets. It never goes to the browser."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except StreamlitSecretNotFoundError:
+        return ""
 
 
 def use_example(question: str) -> None:
-    """Fill in the question box. Nothing is sent until Ask is selected."""
-    state.draft = question
+    """Send an example through the same path as a typed question."""
+    state.pending_question = question
 
 
-def disconnect() -> None:
-    state.agent = None
+def new_chat() -> None:
+    """Forget the conversation but keep the connection and model."""
+    state.agent.reset()
+    state.history = []
+    state.error = None
+    state.failed_question = None
+
+
+def selected_model() -> str:
+    choice = state.get("model_choice", os.environ.get("GEMINI_MODEL"))
+    return choice if choice in state.models else state.models[0]
+
+
+def change_model() -> None:
+    """Start a new chat, because a conversation's history is tied to the model that wrote it."""
+    state.agent = gemini_agent.GeminiAgent(state.agent.client, selected_model())
     state.history = []
     state.error = None
 
 
-def connect(key: str, model_choice: str) -> None:
-    """Check the key by listing models, which generates no content."""
-    key = key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
-        state.error = "Enter a Gemini API key to connect."
-        return
-    requested = None if model_choice == AUTOMATIC_MODEL else model_choice
+def retry_connection() -> None:
+    state.connection_error = None
+
+
+def connect(key: str) -> None:
+    """List the models this key can use, which generates no content."""
     try:
         client = gemini_agent.build_client(key)
-        model = gemini_agent.select_model(client, requested)
+        state.models = gemini_agent.usable_models(client, os.environ.get("GEMINI_MODEL"))
     except AgentError as error:
-        state.error = str(error)
+        state.connection_error = str(error)
     except gemini_errors.APIError as error:
-        state.error = f"Could not connect. {cli._gemini_error(error)}"
+        state.connection_error = f"Could not connect to Gemini. {cli._gemini_error(error)}"
     else:
-        state.agent = gemini_agent.GeminiAgent(client, model)
-        state.history = []
-        state.error = None
+        state.agent = gemini_agent.GeminiAgent(client, selected_model())
 
 
-def with_selected_filter(question: str, preset: str) -> str:
-    """Pass a selected size filter to the model. The model still chooses the tools."""
-    minimum = PASSENGER_PRESETS[preset]
-    if not minimum:
-        return question
-    return f"{question}\n\n(Selected filter for rankings: at least {minimum:,} 2025 departing passengers.)"
-
-
-def ask(question: str, preset: str = ALL_AIRPORTS) -> None:
-    """Make one attempt. A failure is reported and is never retried automatically."""
+def ask(question: str) -> None:
+    """Make one attempt. A failure keeps the question for the user to resend, and nothing is retried automatically."""
+    state.failed_question = question
     try:
-        answer = state.agent.ask(with_selected_filter(question, preset))
+        answer = state.agent.ask(question)
     except AgentError as error:
         state.error = str(error)
     except gemini_errors.APIError as error:
         state.error = cli._gemini_error(error)
-        if error.code == 503:
-            state.error += " This is usually temporary. You can try again later or connect with another model."
     else:
         state.history.append((question, answer))
         state.error = None
+        state.failed_question = None
 
 
 def show_tool_evidence(evidence: presentation.ToolEvidence, key: str) -> None:
@@ -102,8 +120,10 @@ def show_tool_evidence(evidence: presentation.ToolEvidence, key: str) -> None:
     for warning in evidence.warnings:
         st.warning(warning)
 
-    results, definitions, sources, caveats, raw = st.tabs(["Results", "Definitions", "Sources", "Caveats", "Raw"])
+    results, definitions, sources, caveats = st.tabs(["Results", "Definitions", "Sources", "Caveats"])
     with results:
+        if not evidence.tables:
+            st.caption("This answer did not rely on a table from this tool call.")
         for table in evidence.tables:
             st.markdown(f"**{table.title}**")
             st.dataframe(table.data, hide_index=True, width="stretch")
@@ -121,8 +141,6 @@ def show_tool_evidence(evidence: presentation.ToolEvidence, key: str) -> None:
             st.warning(caveat)
         for caveat in evidence.caveats:
             st.markdown(f"- {presentation.escape_markdown(caveat)}")
-    with raw:
-        st.json(evidence.raw, expanded=False)
 
 
 def show_score_context() -> None:
@@ -139,18 +157,25 @@ def show_score_context() -> None:
         st.markdown(f"{tools.SIZE_BIAS} {tools.BASE_2022} {tools.METRIC_OVERLAP}")
 
 
-def show_answer(question: str, answer: Answer, earlier_calls: list, latest: bool, key: str) -> None:
+def show_question(question: str) -> None:
+    with st.chat_message("user"):
+        st.markdown(presentation.escape_markdown(question))
+
+
+def show_answer(answer: Answer, earlier_calls: list, key: str) -> None:
     conclusion, rest = presentation.split_answer(answer.text)
-    reports_score = presentation.reports_opportunity_score(answer.tool_calls, f"{conclusion}\n\n{rest}", earlier_calls)
+    reports_score = presentation.reports_opportunity_score(
+        answer.tool_calls, f"{conclusion}\n\n{rest}", earlier_calls, answer.primary_table
+    )
 
     def displayed(tables: list[presentation.Table]) -> list[presentation.Table]:
         return presentation.without_score_proxy_note(tables) if reports_score else tables
 
-    with st.chat_message("user"):
-        st.markdown(presentation.escape_markdown(question))
     with st.chat_message("assistant"):
         st.markdown(presentation.escape_markdown(conclusion))
-        for table in displayed(presentation.main_tables(answer.tool_calls)):
+        for table in presentation.with_short_ranks(
+            displayed(presentation.main_tables(answer.tool_calls, answer.primary_table, answer.text))
+        ):
             st.markdown(f"**{table.title}**")
             st.dataframe(table.data, hide_index=True, width="stretch")
             if table.note:
@@ -168,90 +193,85 @@ def show_answer(question: str, answer: Answer, earlier_calls: list, latest: bool
             st.warning("No tool was called, so no data result supports this answer.")
         if reports_score:
             show_score_context()
-    if answer.tool_calls:
-        with st.expander("Evidence, methodology, sources and caveats (generated by Python, not the LLM)"):
-            for position, call in enumerate(answer.tool_calls):
-                evidence = presentation.build_evidence(call)
-                evidence.tables = displayed(evidence.tables)
-                show_tool_evidence(evidence, f"{key}-{position}")
+        if answer.tool_calls:
+            with st.expander("Explore the data & sources"):
+                for position, call in enumerate(answer.tool_calls):
+                    evidence = presentation.focused_evidence(
+                        presentation.build_evidence(call), call, answer.tool_calls, answer.text, answer.primary_table
+                    )
+                    evidence.tables = displayed(evidence.tables)
+                    show_tool_evidence(evidence, f"{key}-{position}")
 
+
+api_key = server_api_key()
+if api_key and state.agent is None and state.connection_error is None:
+    connect(api_key)
 
 with st.sidebar:
-    st.header("Connection")
-    if state.agent is None:
-        models = [AUTOMATIC_MODEL, *gemini_agent.PREFERRED_MODELS]
+    if state.agent is not None:
         preferred = os.environ.get("GEMINI_MODEL")
-        if preferred and preferred not in models:
-            models.append(preferred)
-        with st.form("connect", clear_on_submit=True):
-            key_input = st.text_input(
-                "Gemini API key",
-                type="password",
-                help="Kept in memory for this browser session only. It is never saved.",
-            )
-            model_choice = st.selectbox("Model", models, index=models.index(preferred) if preferred else 0)
-            connect_clicked = st.form_submit_button("Connect", width="stretch")
-        if os.environ.get("GEMINI_API_KEY"):
-            st.caption("Leave the key blank to use GEMINI_API_KEY from this environment.")
-        st.caption("Connecting checks which models your key can use. It generates no content.")
-        if connect_clicked:
-            connect(key_input, model_choice)
-            st.rerun()
-    else:
-        agent = state.agent
-        st.success(f"Connected to {agent.model}")
-        st.metric("Gemini calls this session", f"{agent.calls_used} of {agent.call_limit}")
-        st.caption(
-            "A question usually takes 2 calls, and failed requests are counted. This counter covers this "
-            "connection only, so keep track of your total allowance separately."
+        options = [AUTOMATIC_MODEL, *state.models]
+        st.selectbox(
+            "Model",
+            options,
+            index=options.index(preferred) if preferred in options else 0,
+            key="model_choice",
+            on_change=change_model,
+            help="Changing the model starts a new chat.",
         )
-        st.button("Disconnect", on_click=disconnect, width="stretch")
 
-    st.divider()
-    st.header("About the data")
-    st.markdown(
-        "- **Demand:** BTS T-100, 2015, 2022 and 2025\n"
-        "- **Congestion:** BTS On-Time Performance, 2025\n"
-        "- **Long-haul:** T-100 route file, Jan-Jul 2026, US carriers only\n"
-        "- **Eligibility:** FAA CY2025 enplanements"
+title_column, action_column = st.columns([5, 1], vertical_alignment="center")
+with title_column:
+    st.title("Airport Investment Intelligence")
+    st.caption("Screening analysis of US airports using public BTS and FAA data.")
+with action_column:
+    st.button(
+        "New Chat",
+        on_click=new_chat,
+        disabled=state.agent is None or not (state.history or state.error or state.failed_question),
+        width="stretch",
     )
-    st.caption("All calculations run in Python. The LLM chooses tools and explains their results.")
 
-st.title("Airport Investment Intelligence")
-st.markdown("Screening analysis of US airports using public BTS and FAA data.")
+if not api_key:
+    st.warning(MISSING_KEY_MESSAGE)
+elif state.connection_error:
+    st.error(state.connection_error)
+    st.button("Try again", on_click=retry_connection)
 
-st.markdown("**Example questions**")
-st.caption("Selecting one fills in the question box. Nothing is sent until you select Ask.")
-example_columns = st.columns(2)
-for position, (label, question) in enumerate(EXAMPLES.items()):
-    with example_columns[position % 2]:
-        st.button(f"{label}: {question}", on_click=use_example, args=(question,), key=f"example-{position}", width="stretch")
+question_input = st.chat_input("Ask about US airports", disabled=state.agent is None)
+submitted = (state.pop("pending_question", None) or question_input or "").strip()
 
-with st.form("question", clear_on_submit=True):
-    question_input = st.text_area("Your question", key="draft", height=80, placeholder="Ask about US airports")
-    passenger_preset = st.selectbox(
-        "Minimum 2025 departing passengers (optional)",
-        list(PASSENGER_PRESETS),
-        help="This limits which airports are shown. It never changes a score or national rank. "
-        "You can also ask for any other size in your question.",
-    )
-    ask_clicked = st.form_submit_button("Ask", type="primary", disabled=state.agent is None)
-if state.agent is None:
-    st.caption("Connect in the sidebar to ask a question. On a narrow screen, open the sidebar with the arrow at the top left.")
+if not state.history and not submitted and not state.failed_question:
+    st.subheader("What would you like to explore?")
+    st.html(EXAMPLE_CARD_STYLE)
+    with st.container(key="example-cards"):
+        example_columns = st.columns(2)
+        for position, example in enumerate(EXAMPLES):
+            with example_columns[position % 2]:
+                st.button(
+                    example,
+                    on_click=use_example,
+                    args=(example,),
+                    key=f"example-{position}",
+                    disabled=state.agent is None,
+                    width="stretch",
+                )
 
-if ask_clicked and question_input.strip():
-    with st.spinner("Choosing a tool and analyzing the data..."):
-        ask(question_input.strip(), passenger_preset)
+for position, (question, answer) in enumerate(state.history):
+    earlier_calls = [call for _, earlier in state.history[:position] for call in earlier.tool_calls]
+    show_question(question)
+    show_answer(answer, earlier_calls, key=str(position))
+
+if submitted:
+    # Drawn once while waiting. The rerun then draws it from the history, so nothing appears twice.
+    show_question(submitted)
+    with st.chat_message("assistant"), st.spinner("Choosing a tool and analyzing the data..."):
+        ask(submitted)
     st.rerun()
 
+if state.failed_question:
+    show_question(state.failed_question)
 if state.error:
     st.error(state.error)
-
-if state.history:
-    st.divider()
-    for position in range(len(state.history) - 1, -1, -1):
-        question, answer = state.history[position]
-        earlier_calls = [call for _, earlier in state.history[:position] for call in earlier.tool_calls]
-        show_answer(question, answer, earlier_calls, latest=position == len(state.history) - 1, key=str(position))
-        if position:
-            st.divider()
+if state.failed_question and state.agent is not None:
+    st.button("Ask again", on_click=use_example, args=(state.failed_question,))
