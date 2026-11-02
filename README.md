@@ -142,8 +142,11 @@ last tool results as JSON, or `/quit` to exit.
 | Score | `src/scoring.py` | 11 weighted metrics against a fixed national peer group |
 | Data | `src/pipeline.py` | Fetches, validates and snapshots public data |
 
-Answers lead with a short conclusion. Results tables are built in Python from tool output, and the
-LLM writes only the interpretation. Full evidence stays in a collapsed section.
+See [docs/DESIGN.md](docs/DESIGN.md) for the architecture, where AI is used, and key design tradeoffs.
+
+Answers lead with a short conclusion. Python generates the structured results tables, scores and
+ranks from tool output; the LLM writes the narrative and may reference those figures. Full evidence
+stays in a collapsed section.
 
 The number check is a limited safeguard, not full verification. It flags some figures that match
 no tool result and shows "[figure not verified]" in their place in the answer. The command line also
