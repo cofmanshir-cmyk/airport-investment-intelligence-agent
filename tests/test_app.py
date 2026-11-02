@@ -2062,6 +2062,28 @@ def test_answer_without_a_tool_is_flagged(run_app):
     assert any("No tool was called" in item.value for item in app.warning)
 
 
+def test_follow_up_reusing_earlier_airport_data_is_not_flagged_as_unsupported(run_app):
+    network = FakeNetwork(
+        function_call("compare_airports", {"airports": ["BOS", "PWM"], "table_sections": ["passenger_growth"]}),
+        text_reply("BOS and PWM compared."),
+        text_reply("PWM is the one to investigate first, while BOS is already very large."),
+    )
+    app = ask(connect(run_app(network)), "Compare BOS and PWM")
+    app = ask(app, "So which one would you recommend to invest?")
+    assert len(assistant_messages(app)) == 2
+    assert "No tool was called" not in page_text(app)
+    assert not app.warning or all("No tool was called" not in item.value for item in app.warning)
+    assert any(cli.EARLIER_DATA_NOTE in item.value for item in app.caption)
+
+
+def test_command_line_evidence_distinguishes_reused_data_from_no_data():
+    call = ToolCall("compare_airports", {}, tools.compare_airports(["BOS", "PWM"], ["passenger_growth"]), False)
+    follow_up = Answer("PWM is the one to investigate first.", [])
+    assert cli.EARLIER_DATA_NOTE in cli.render_evidence(follow_up, [call])
+    assert cli.NO_TOOL_WARNING in cli.render_evidence(follow_up)
+    assert cli.NO_TOOL_WARNING in cli.render_evidence(Answer("Load factor is passengers divided by seats.", []), [call])
+
+
 def test_server_error_is_shown_once_and_never_retried(run_app):
     network = FakeNetwork({"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}}, status=503)
     app = ask(connect(run_app(network)), "Question")

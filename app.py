@@ -173,8 +173,11 @@ def show_answer(answer: Answer, earlier_calls: list, key: str) -> None:
         notice = presentation.small_base_notice(answer.tool_calls, answer.text)
         if notice:
             st.warning(notice, icon="⚠️")
-        if not answer.tool_calls:
-            st.warning("No tool was called, so no data result supports this answer.")
+        no_tool = cli.no_tool_notice(answer, earlier_calls)
+        if no_tool == cli.NO_TOOL_WARNING:
+            st.warning(no_tool)
+        elif no_tool:
+            st.caption(no_tool)
         if reports_score:
             show_score_context()
         if answer.tool_calls:
