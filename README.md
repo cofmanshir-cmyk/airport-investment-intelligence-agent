@@ -1,5 +1,7 @@
 # Airport Investment Intelligence Agent
 
+🚀 **Live Demo:** https://airport-investment-intelligence.streamlit.app/
+
 Ask airport investment questions in plain English. A real LLM chooses a deterministic Python
 tool, the tool calculates the result on public BTS and FAA data, and the LLM explains it.
 
