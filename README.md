@@ -6,51 +6,48 @@ tool, the tool calculates the result on public BTS and FAA data, and the LLM exp
 This is a working demo. The **Airport Opportunity Score** is a preliminary screening proxy, not
 investment advice or a return forecast. See [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
-## Try it
+## Getting started
 
-In a Codespaces terminal, from the project folder:
+Run the web app with your own Gemini API key. You need Python 3.11 or newer. The commands are for
+macOS, Linux and Codespaces; on Windows, use `.venv\Scripts\` in place of `.venv/bin/`.
+
+**1. Clone the repository and install the dependencies.**
 
 ```bash
+git clone https://github.com/cofmanshir-cmyk/airport-investment-intelligence-agent-new.git
+cd airport-investment-intelligence-agent-new
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m src.cli
 ```
 
-You need an API key from the [Anthropic Console](https://console.anthropic.com/). The app asks
-for it with hidden input and keeps it in memory only. To avoid typing it each time, set
-`ANTHROPIC_API_KEY` as a [Codespaces secret](https://docs.github.com/en/codespaces/managing-your-codespace/managing-your-account-specific-secrets-for-github-codespaces).
-Never put a key in a repository file.
+**2. Get a Gemini API key** from [Google AI Studio](https://aistudio.google.com/apikey). Questions use
+your own key and count against its Gemini quota and any billing on your account.
 
-Each question calls the paid API, using `claude-opus-5-5` by default. Set `ANTHROPIC_MODEL` to
-use another model.
+**3. Create `.streamlit/secrets.toml`** in the project folder, using a text editor, with this one line.
+Replace `your-key-here` with your key and keep the straight quotes:
 
-### Use Gemini instead
-
-```bash
-.venv/bin/python -m src.cli --provider gemini
+```toml
+GEMINI_API_KEY = "your-key-here"
 ```
 
-The app asks for your Gemini API key the same way, confirms which Flash model the key can use,
-and then uses the same tools and safeguards. Automatic retries of failed requests are off, and Google
-enforces its own quota; if it runs out, you see a clear message and nothing is resent. Set `GEMINI_MODEL`
-to choose a model.
+This is a local file that git ignores, and it **must never be committed**. Don't force-add it or copy
+the key into any other project file. If a key is ever committed, revoke it in Google AI Studio and
+create a new one.
 
-Gemini can answer without calling a tool. If that answer names an airport or states a figure with no
-retrieved data behind it, the agent discards it and makes one further attempt that requires a tool
-call, which costs one or two extra Gemini calls. If there is still no data, no answer is shown. General
-questions about definitions or methods stay free of tools. The check confirms data was retrieved for the
-airport, not that every sentence is right, so it doesn't replace the number check or the evidence section.
+If the `GEMINI_API_KEY` environment variable is set, including as a Codespaces secret, it takes
+precedence over this file. An old value there silently replaces the key in the file, so update or
+unset it if the app uses the wrong key.
 
-### Use the web interface
+**4. Run the app** from the project folder:
 
 ```bash
 .venv/bin/streamlit run app.py
 ```
 
-In Codespaces, open the **Ports** tab, then open port 8501 in your browser. Keep the port's
-visibility **Private**. The page uses Gemini, with the key configured on the server: set
-`GEMINI_API_KEY` as an environment variable or Codespaces secret, or add it to
-`.streamlit/secrets.toml`, which git ignores. The key never reaches the browser.
+Open <http://localhost:8501> in your browser. In Codespaces, open the **Ports** tab, then open port 8501,
+and keep the port's visibility **Private**. The key stays on the server and never reaches the browser.
+
+### How the web app uses Gemini
 
 The page chooses the model itself: the first two of `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`,
 `gemini-3.6-flash` and `gemini-3.8-flash` that the key can use become the preferred model and its one
@@ -64,6 +61,42 @@ agent.
 The server writes `TIMING` lines to stderr with each Gemini request's duration, model and token counts,
 each tool's duration, and whether a fallback or grounding retry occurred. They never include keys,
 questions or answers.
+
+Gemini can answer without calling a tool. If that answer names an airport or states a figure with no
+retrieved data behind it, the agent discards it and makes one further attempt that requires a tool
+call, which costs one or two extra Gemini calls. If there is still no data, no answer is shown. General
+questions about definitions or methods stay free of tools. The check confirms data was retrieved for the
+airport, not that every sentence is right, so it doesn't replace the number check or the evidence section.
+
+## Optional: command-line app
+
+The web app doesn't need this section. After step 1 above, you can also chat in the terminal, using
+Anthropic or Gemini. The command-line app doesn't read `.streamlit/secrets.toml`.
+
+### Use Anthropic
+
+```bash
+.venv/bin/python -m src.cli
+```
+
+You need an API key from the [Anthropic Console](https://console.anthropic.com/). The app asks
+for it with hidden input and keeps it in memory only. To avoid typing it each time, set
+`ANTHROPIC_API_KEY` as a [Codespaces secret](https://docs.github.com/en/codespaces/managing-your-codespace/managing-your-account-specific-secrets-for-github-codespaces).
+Never put an Anthropic key in a repository file.
+
+Each question calls the paid API, using `claude-opus-5-5` by default. Set `ANTHROPIC_MODEL` to
+use another model.
+
+### Use Gemini
+
+```bash
+.venv/bin/python -m src.cli --provider gemini
+```
+
+The app asks for your Gemini API key the same way, or uses the `GEMINI_API_KEY` environment variable,
+confirms which Flash model the key can use, and then uses the same tools and safeguards. Automatic
+retries of failed requests are off, and Google enforces its own quota; if it runs out, you see a clear
+message and nothing is resent. Set `GEMINI_MODEL` to choose a model.
 
 ## Data
 
@@ -91,8 +124,8 @@ data & sources** section shows the sources, definitions and caveats behind that 
 - Give me a profile of SFO.
 - What percentage of flights departing ANC are long-haul?
 
-Follow-ups work, such as "what about at 2,400 miles?". Type `/raw` to see the last tool results
-as JSON, or `/quit` to exit.
+Follow-ups work, such as "what about at 2,400 miles?". On the command line, type `/raw` to see the
+last tool results as JSON, or `/quit` to exit.
 
 ## How it works
 

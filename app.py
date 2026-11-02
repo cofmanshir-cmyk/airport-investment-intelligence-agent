@@ -239,7 +239,7 @@ if state.history:
 if submitted:
     # Drawn once while waiting. The rerun then draws it from the history, so nothing appears twice.
     show_question(submitted)
-    with st.chat_message("assistant"), st.spinner("Choosing a tool and analyzing the data..."):
+    with st.chat_message("assistant"), st.spinner("Thinking..."):
         ask(submitted)
     st.rerun()
 
