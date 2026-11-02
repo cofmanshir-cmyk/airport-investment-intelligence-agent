@@ -14,8 +14,8 @@ macOS, Linux and Codespaces; on Windows, use `.venv\Scripts\` in place of `.venv
 **1. Clone the repository and install the dependencies.**
 
 ```bash
-git clone https://github.com/cofmanshir-cmyk/airport-investment-intelligence-agent-new.git
-cd airport-investment-intelligence-agent-new
+git clone https://github.com/cofmanshir-cmyk/airport-investment-intelligence-agent.git
+cd airport-investment-intelligence-agent
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
